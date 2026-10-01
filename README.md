@@ -16,23 +16,42 @@ mapa de geolocalización, atajos de teclado y detección de fotos duplicadas o e
 
 ## Puesta en marcha
 
-Requisitos: Python 3.10+ y `exiftool` (para leer la fecha y el GPS de los vídeos).
-Las herramientas de compresión solo hacen falta para el paso opcional de optimización.
+### Instalación en un solo comando
+
+```bash
+bash instalar.sh
+```
+
+Detecta si usas **Fedora** (`dnf`) o **Debian/Ubuntu** (`apt`), instala los paquetes del
+sistema (Python, exiftool, ffmpeg, jpegoptim, optipng, jpegtran y, si existe, oxipng),
+prepara el entorno de Python y abre la app en el navegador. Te pedirá tu contraseña
+para `sudo`.
+
+Opciones:
+
+- `bash instalar.sh --rpmfusion` (solo Fedora): instala además el **ffmpeg completo de
+  RPM Fusion**, con H.264/H.265 (y los códecs con los que Firefox reproduce MP4).
+  Sin esta opción se usa el `ffmpeg-free` de Fedora y la optimización de vídeo usa AV1.
+- `bash instalar.sh --sin-abrir`: instala todo sin abrir la app.
+
+### Uso diario
+
+```bash
+./run.sh
+```
+
+`run.sh` comprueba el entorno virtual `.venv/`, instala las librerías de Python si
+cambió `requirements.txt` y abre la app (`http://localhost:8501`). Para usar otro
+puerto: `PORT=8600 ./run.sh`. Ciérrala con `Ctrl+C` en la terminal.
+
+### Instalación manual (alternativa)
 
 **Fedora** (Python ya incluye `venv`):
 
 ```bash
-sudo dnf install python3 perl-Image-ExifTool
-# Para el paso opcional de optimización:
-sudo dnf install ffmpeg-free jpegoptim optipng libjpeg-turbo-utils
+sudo dnf install python3 perl-Image-ExifTool ffmpeg-free jpegoptim optipng libjpeg-turbo-utils
 sudo dnf install oxipng   # opcional (si no está, se usa optipng)
-```
-
-El `ffmpeg-free` de Fedora no trae H.264 ni H.265. La app lo detecta y ofrece **AV1
-(SVT-AV1)**, que comprime más y Firefox reproduce. Si además quieres H.264/H.265,
-instala el ffmpeg completo de RPM Fusion:
-
-```bash
+# ffmpeg completo con H.264/H.265 (RPM Fusion), opcional:
 sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
 sudo dnf swap ffmpeg-free ffmpeg --allowerasing
 ```
@@ -40,22 +59,14 @@ sudo dnf swap ffmpeg-free ffmpeg --allowerasing
 **Debian / Ubuntu**:
 
 ```bash
-sudo apt install python3 python3-venv libimage-exiftool-perl
-sudo apt install ffmpeg jpegoptim optipng libjpeg-turbo-progs   # optimización
+sudo apt install python3 python3-venv libimage-exiftool-perl ffmpeg jpegoptim optipng libjpeg-turbo-progs
 ```
+
+Después: `chmod +x run.sh && ./run.sh`.
 
 Sin exiftool la app funciona igual, pero los vídeos aparecen sin fecha ni ubicación
-(y quedan fuera si filtras por fechas sin incluir los «sin fecha»).
-
-```bash
-chmod +x run.sh   # solo la primera vez
-./run.sh
-```
-
-`run.sh` crea el entorno virtual `.venv/`, instala las dependencias (solo la
-primera vez o cuando cambia `requirements.txt`) y abre la app en el navegador
-(`http://localhost:8501`). Para usar otro puerto: `PORT=8600 ./run.sh`.
-Ciérrala con `Ctrl+C` en la terminal.
+(y quedan fuera si filtras por fechas sin incluir los «sin fecha»). Sin las
+herramientas de compresión, solo deja de estar disponible el paso opcional 3️⃣.
 
 ## Uso
 
@@ -142,7 +153,7 @@ Paso final e independiente: no se toca nada salvo que tú lo confirmes. Puedes p
 `run.sh` abre la app en tu navegador por defecto (Firefox incluido).
 Firefox no reproduce vídeos **HEVC/H.265** (los del iPhone), **AVI** ni **MKV con
 H.264**; para esos usa **🦊 Vista previa WebM**. En Fedora, si Firefox tampoco
-reproduce MP4 normales (H.264), instala los códecs completos de RPM Fusion (ver arriba)
+reproduce MP4 normales (H.264), usa `bash instalar.sh --rpmfusion`
 o usa igualmente la vista previa WebM. Si optimizas vídeos para verlos en Firefox,
 elige **AV1** en lugar de H.265.
 

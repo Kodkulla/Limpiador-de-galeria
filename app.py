@@ -1178,6 +1178,9 @@ def tools_panel() -> None:
         if t["ffmpeg"]:
             st.markdown("Códecs de vídeo disponibles: " + (", ".join(
                 comp.VIDEO_CODECS[c][0].split(" (")[0] for c in codecs) or "ninguno"))
+        st.markdown("Todo de una vez (en la carpeta de la app): `bash instalar.sh`"
+                    + (" · con H.264/H.265: `bash instalar.sh --rpmfusion`" if comp.IS_FEDORA else "")
+                    + ". O a mano:")
         st.code(comp.install_cmd("ffmpeg", "jpegoptim", "optipng", "jpegtran", "exiftool") + "\n"
                 + comp.install_cmd("oxipng") + "   # opcional", language="bash")
         if comp.IS_FEDORA and not {"libx264", "libx265"} & set(codecs):
