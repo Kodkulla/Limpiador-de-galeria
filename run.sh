@@ -11,9 +11,16 @@ URL="http://localhost:${PORT}"
 REQ_FILE="requirements.txt"
 REQ_STAMP="${VENV_DIR}/.requirements.sha256"
 
+# Gestor de paquetes para los mensajes de ayuda (Fedora: dnf; Debian/Ubuntu: apt)
+if command -v dnf >/dev/null 2>&1; then
+    PKG="dnf"; PKG_PY="python3"; PKG_EXIF="perl-Image-ExifTool"
+else
+    PKG="apt"; PKG_PY="python3 python3-venv"; PKG_EXIF="libimage-exiftool-perl"
+fi
+
 # 1. Python 3
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "❌ No se encontró python3. Instálalo, p. ej.: sudo apt install python3 python3-venv"
+    echo "❌ No se encontró python3. Instálalo con: sudo ${PKG} install ${PKG_PY}"
     exit 1
 fi
 
@@ -23,7 +30,7 @@ if [ ! -x "${VENV_DIR}/bin/python" ]; then
     if ! python3 -m venv "${VENV_DIR}"; then
         rm -rf "${VENV_DIR}"
         echo "❌ No se pudo crear el entorno virtual."
-        echo "   En Debian/Ubuntu instala: sudo apt install python3-venv"
+        echo "   Instala el soporte de venv con: sudo ${PKG} install ${PKG_PY}"
         exit 1
     fi
 fi
@@ -42,7 +49,12 @@ fi
 # 4. exiftool (opcional, para fecha y GPS de vídeos)
 if ! command -v exiftool >/dev/null 2>&1; then
     echo "ℹ️  exiftool no está instalado: los vídeos se verán, pero sin fecha ni GPS."
-    echo "   Instálalo con: sudo apt install libimage-exiftool-perl"
+    echo "   Instálalo con: sudo ${PKG} install ${PKG_EXIF}"
+fi
+FFMPEG_ENCODERS="$(command -v ffmpeg >/dev/null 2>&1 && ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+if [ -n "${FFMPEG_ENCODERS}" ] && ! grep -qE "libx26[45]" <<< "${FFMPEG_ENCODERS}"; then
+    echo "ℹ️  Tu ffmpeg no incluye H.264/H.265 (normal en Fedora con «ffmpeg-free»);"
+    echo "   la optimización de vídeo usará AV1. Detalles en el README (RPM Fusion)."
 fi
 
 # 5. Abrir el navegador cuando el servidor responda

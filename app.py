@@ -301,7 +301,8 @@ def _parse_video_meta(raw: dict) -> dict:
         meta["gps"] = (lat, lon)
     w, h = raw.get("ImageWidth"), raw.get("ImageHeight")
     if isinstance(w, (int, float)) and isinstance(h, (int, float)) and w and h:
-        if int(_to_float(raw.get("Rotation")) or 0) in (90, 270):
+        rot = _to_float(raw.get("Rotation"))
+        if rot == rot and int(rot) % 360 in (90, 270):  # rot == rot descarta NaN (sin etiqueta)
             w, h = h, w
         meta["width"], meta["height"] = int(w), int(h)
     dur = _to_float(raw.get("Duration"))
@@ -728,7 +729,7 @@ def sidebar_metadata(item: dict) -> None:
         if not EXIFTOOL:
             sb.warning(
                 "Para leer fecha y GPS de vídeos instala exiftool:\n\n"
-                "`sudo apt install libimage-exiftool-perl`"
+                f"`{comp.install_cmd('exiftool')}`"
             )
     else:
         meta = read_metadata(str(path), stat.st_mtime)
@@ -772,21 +773,34 @@ def video_player(path: Path) -> None:
     size_mb = path.stat().st_size / (1024 * 1024)
     _, mid, _ = st.columns([1, 10, 1])
     with mid:
-        embed = size_mb <= VIDEO_EMBED_MAX_MB or st.checkbox(
+        st.markdown("<style>[data-testid='stVideo']{max-height:72vh}</style>", unsafe_allow_html=True)
+        preview = comp.preview_path(path)
+        if preview.exists():
+            st.video(str(preview), format="video/webm")
+            st.caption("Mostrando la vista previa WebM (720p) generada para el navegador; "
+                       "el archivo original no se modifica.")
+        elif size_mb <= VIDEO_EMBED_MAX_MB or st.checkbox(
             f"Vídeo grande ({size_mb:.0f} MB): cargar en el navegador de todos modos",
             key=f"bigvid_{path}",
-        )
-        if embed:
-            st.markdown(
-                "<style>[data-testid='stVideo']{max-height:72vh}</style>", unsafe_allow_html=True
-            )
+        ):
             st.video(str(path), format=VIDEO_MIME.get(path.suffix.lower(), "video/mp4"))
-        c1, c2 = st.columns([3, 1], vertical_alignment="center")
+        c1, c2, c3 = st.columns([3, 2, 2], vertical_alignment="center")
         c1.caption(
-            "Si el vídeo no se reproduce (AVI, algunos MKV o HEVC/H.265 de iPhone), "
-            "ábrelo con el reproductor del sistema."
+            "¿No se reproduce? Firefox no admite HEVC/H.265 (iPhone), AVI ni MKV con H.264: "
+            "genera una vista previa WebM o ábrelo con el reproductor del sistema."
         )
-        if c2.button("▶️ Abrir en reproductor", width="stretch", key="open_sys"):
+        if not preview.exists() and c2.button(
+            "🦊 Vista previa WebM", width="stretch", key="mk_preview",
+            disabled=not comp.can_make_preview(),
+            help="Crea una copia ligera VP9 en ~/.cache/limpiador-galeria (se reproduce en cualquier navegador)",
+        ):
+            with st.spinner("Generando vista previa…"):
+                try:
+                    comp.make_browser_preview(path)
+                except Exception as e:  # noqa: BLE001
+                    ss.flash = ("error", f"No se pudo generar la vista previa: {e}")
+            st.rerun()
+        if c3.button("▶️ Abrir en reproductor", width="stretch", key="open_sys"):
             open_with_system(str(path))
 
 
@@ -1160,8 +1174,17 @@ def tools_panel() -> None:
             f"- {ok('ffmpeg')} **ffmpeg** / {ok('ffprobe')} ffprobe (vídeos)\n"
             f"- {ok('exiftool')} **exiftool** (refuerza fecha/GPS de los vídeos)"
         )
-        st.code("sudo apt install ffmpeg jpegoptim optipng libjpeg-turbo-progs libimage-exiftool-perl\n"
-                "sudo apt install oxipng   # opcional: Debian 13 / Ubuntu 24.10 o posteriores", language="bash")
+        codecs = comp.available_video_codecs()
+        if t["ffmpeg"]:
+            st.markdown("Códecs de vídeo disponibles: " + (", ".join(
+                comp.VIDEO_CODECS[c][0].split(" (")[0] for c in codecs) or "ninguno"))
+        st.code(comp.install_cmd("ffmpeg", "jpegoptim", "optipng", "jpegtran", "exiftool") + "\n"
+                + comp.install_cmd("oxipng") + "   # opcional", language="bash")
+        if comp.IS_FEDORA and not {"libx264", "libx265"} & set(codecs):
+            st.info("El ffmpeg de Fedora («ffmpeg-free») no incluye H.264 ni H.265; puedes usar AV1, "
+                    "que comprime más y Firefox lo reproduce. Para tener H.264/H.265, instala el "
+                    "ffmpeg completo de RPM Fusion:")
+            st.code(comp.RPMFUSION_CMD, language="bash")
 
 
 def optimization_view(proj: dict) -> None:
@@ -1220,13 +1243,17 @@ def opt_config(proj: dict) -> None:
                            key="opt_webp", help="Píxeles idénticos, pero la extensión cambia a .webp.")
     with col_v.container(border=True):
         st.markdown("**🎬 Vídeos**")
-        codec = st.selectbox(
-            "Códec", ["libx265", "libx264"], key="opt_codec",
-            format_func=lambda c: "H.265 / HEVC (más compresión)" if c == "libx265"
-            else "H.264 / AVC (máxima compatibilidad)",
-        )
-        crf = st.slider("CRF (menor = más calidad)", 14, 30, 22 if codec == "libx265" else 18,
-                        key=f"opt_crf_{codec}", help="Visualmente indistinguible: ~18 en H.264 y ~22 en H.265.")
+        codecs = comp.available_video_codecs()
+        if not codecs:
+            st.warning("Tu ffmpeg no tiene codificadores H.265, AV1 ni H.264 (o no está instalado): "
+                       "los vídeos se omitirán.")
+            codecs = list(comp.VIDEO_CODECS)
+        codec = st.selectbox("Códec", codecs, key="opt_codec",
+                             format_func=lambda c: comp.VIDEO_CODECS[c][0])
+        _, crf_default, (crf_min, crf_max), _ = comp.VIDEO_CODECS[codec]
+        crf = st.slider("CRF (menor = más calidad)", crf_min, crf_max, crf_default,
+                        key=f"opt_crf_{codec}",
+                        help="Visualmente indistinguible: ~18 en H.264, ~22 en H.265 y ~28 en AV1.")
         preset = st.select_slider("Preset", ["fast", "medium", "slow"], value="medium", key="opt_preset",
                                   help="Más lento = archivos algo más pequeños con la misma calidad.")
         skip_hevc = st.checkbox("Omitir vídeos que ya están en HEVC/AV1/VP9", value=True, key="opt_skiphevc")
@@ -1337,10 +1364,23 @@ def opt_results(proj: dict, run: dict) -> None:
                            cached_frame(str(tmp_p), tmp_p.stat().st_mtime, t), zoom)
             with st.expander("▶️ Reproducir ambos vídeos"):
                 v1, v2 = st.columns(2)
-                v1.caption(f"Original · {fmt_size(r['orig_size'])}")
-                v1.video(str(src_p))
-                v2.caption(f"Comprimido · {fmt_size(r['new_size'])} (si no se reproduce, el navegador no admite HEVC)")
-                v2.video(str(tmp_p))
+                for col, vp, label in ((v1, src_p, f"Original · {fmt_size(r['orig_size'])}"),
+                                       (v2, tmp_p, f"Comprimido · {fmt_size(r['new_size'])}")):
+                    prev = comp.preview_path(vp)
+                    col.caption(label + (" · vista previa WebM 720p" if prev.exists() else ""))
+                    col.video(str(prev if prev.exists() else vp),
+                              format="video/webm" if prev.exists() else "video/mp4")
+                st.caption("Las vistas previas WebM sirven para comprobar que se reproduce bien; para "
+                           "juzgar la calidad usa el comparador de fotogramas de arriba (resolución completa).")
+                if st.button("🦊 Generar vistas previas WebM (para Firefox)", key="cmp_preview",
+                             disabled=not comp.can_make_preview()):
+                    with st.spinner("Generando vistas previas…"):
+                        try:
+                            comp.make_browser_preview(src_p)
+                            comp.make_browser_preview(tmp_p)
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"No se pudo generar la vista previa: {e}")
+                    st.rerun()
         else:
             compare_slider(src_p.read_bytes(), tmp_p.read_bytes(), zoom)
 

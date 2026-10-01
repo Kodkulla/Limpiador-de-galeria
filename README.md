@@ -16,13 +16,32 @@ mapa de geolocalización, atajos de teclado y detección de fotos duplicadas o e
 
 ## Puesta en marcha
 
-Requisitos: Python 3.10+ con `venv`, y `exiftool` para leer la fecha y el GPS de los vídeos:
+Requisitos: Python 3.10+ y `exiftool` (para leer la fecha y el GPS de los vídeos).
+Las herramientas de compresión solo hacen falta para el paso opcional de optimización.
+
+**Fedora** (Python ya incluye `venv`):
+
+```bash
+sudo dnf install python3 perl-Image-ExifTool
+# Para el paso opcional de optimización:
+sudo dnf install ffmpeg-free jpegoptim optipng libjpeg-turbo-utils
+sudo dnf install oxipng   # opcional (si no está, se usa optipng)
+```
+
+El `ffmpeg-free` de Fedora no trae H.264 ni H.265. La app lo detecta y ofrece **AV1
+(SVT-AV1)**, que comprime más y Firefox reproduce. Si además quieres H.264/H.265,
+instala el ffmpeg completo de RPM Fusion:
+
+```bash
+sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
+sudo dnf swap ffmpeg-free ffmpeg --allowerasing
+```
+
+**Debian / Ubuntu**:
 
 ```bash
 sudo apt install python3 python3-venv libimage-exiftool-perl
-# Para el paso opcional de optimización:
-sudo apt install ffmpeg jpegoptim optipng libjpeg-turbo-progs
-sudo apt install oxipng   # opcional, solo en Debian 13 / Ubuntu 24.10 o posteriores
+sudo apt install ffmpeg jpegoptim optipng libjpeg-turbo-progs   # optimización
 ```
 
 Sin exiftool la app funciona igual, pero los vídeos aparecen sin fecha ni ubicación
@@ -73,8 +92,12 @@ Se admiten `.mp4`, `.mov`, `.mkv`, `.avi`, `.m4v`, `.3gp` y `.webm`. Se previsua
 con un reproductor en el visor y se clasifican igual que las fotos. La fecha
 (`CreationDate`/`CreateDate`) y el GPS (QuickTime `GPSCoordinates`, de Android o iPhone)
 se leen con exiftool, así que el mapa también funciona con vídeos del móvil.
-Si el navegador no puede reproducir el formato (AVI, algunos MKV, HEVC/H.265),
-usa el botón **Abrir en reproductor**, que abre el archivo con el reproductor del sistema.
+Si el navegador no puede reproducir el formato, tienes dos botones bajo el reproductor:
+
+- **🦊 Vista previa WebM**: crea una copia ligera VP9 a 720p en
+  `~/.cache/limpiador-galeria/previews/` y la muestra en su lugar. El original no se toca.
+  Puedes borrar esa carpeta cuando quieras.
+- **▶️ Abrir en reproductor**: abre el archivo con el reproductor del sistema (`xdg-open`).
 Los vídeos de más de 500 MB piden confirmación antes de cargarse en el navegador.
 
 ### 1️⃣ Limpieza de similares
@@ -113,6 +136,15 @@ Paso final e independiente: no se toca nada salvo que tú lo confirmes. Puedes p
   reducen peso se conservan siempre. «Descartar resultados» borra la carpeta temporal.
 - Si se interrumpe (por ejemplo, al cerrar la pestaña), el progreso queda guardado y
   puedes **continuar** después.
+
+### Firefox
+
+`run.sh` abre la app en tu navegador por defecto (Firefox incluido).
+Firefox no reproduce vídeos **HEVC/H.265** (los del iPhone), **AVI** ni **MKV con
+H.264**; para esos usa **🦊 Vista previa WebM**. En Fedora, si Firefox tampoco
+reproduce MP4 normales (H.264), instala los códecs completos de RPM Fusion (ver arriba)
+o usa igualmente la vista previa WebM. Si optimizas vídeos para verlos en Firefox,
+elige **AV1** en lugar de H.265.
 
 ### Atajos de teclado
 

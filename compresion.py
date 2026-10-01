@@ -6,6 +6,7 @@ original: reemplazarlo es responsabilidad de quien llama (tras confirmar).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -16,6 +17,81 @@ from PIL import Image
 
 TOOL_NAMES = ("jpegoptim", "jpegtran", "oxipng", "optipng", "ffmpeg", "ffprobe", "exiftool")
 TOOLS = {name: shutil.which(name) for name in TOOL_NAMES}
+
+
+# --------------------------------------------------------------------------
+# Distribución: comandos de instalación (Fedora/dnf o Debian-Ubuntu/apt)
+# --------------------------------------------------------------------------
+def _os_release() -> dict:
+    try:
+        lines = Path("/etc/os-release").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    return dict(ln.split("=", 1) for ln in lines if "=" in ln)
+
+
+_OS = _os_release()
+_OS_IDS = {_OS.get("ID", "").strip('"')} | set(_OS.get("ID_LIKE", "").strip('"').split())
+IS_FEDORA = bool(_OS_IDS & {"fedora", "rhel", "centos"}) or (shutil.which("dnf") is not None
+                                                              and shutil.which("apt-get") is None)
+PACKAGES = {  # herramienta -> (paquete apt, paquete dnf)
+    "exiftool": ("libimage-exiftool-perl", "perl-Image-ExifTool"),
+    "jpegoptim": ("jpegoptim", "jpegoptim"),
+    "jpegtran": ("libjpeg-turbo-progs", "libjpeg-turbo-utils"),
+    "optipng": ("optipng", "optipng"),
+    "oxipng": ("oxipng", "oxipng"),
+    "ffmpeg": ("ffmpeg", "ffmpeg-free"),
+}
+
+
+def install_cmd(*tools: str) -> str:
+    """`sudo dnf install …` o `sudo apt install …` según la distribución."""
+    pkgs = list(dict.fromkeys(PACKAGES[t][1 if IS_FEDORA else 0] for t in tools))
+    return f"sudo {'dnf' if IS_FEDORA else 'apt'} install {' '.join(pkgs)}"
+
+
+# Fedora trae «ffmpeg-free», sin H.264/H.265: la versión completa está en RPM Fusion
+RPMFUSION_CMD = (
+    "sudo dnf install https://mirrors.rpmfusion.org/free/fedora/"
+    "rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm\n"
+    "sudo dnf swap ffmpeg-free ffmpeg --allowerasing"
+)
+
+
+# --------------------------------------------------------------------------
+# Códecs de vídeo disponibles en el ffmpeg instalado
+# --------------------------------------------------------------------------
+def _ffmpeg_encoders() -> set[str]:
+    if not TOOLS["ffmpeg"]:
+        return set()
+    try:
+        res = subprocess.run([TOOLS["ffmpeg"], "-hide_banner", "-encoders"],
+                             capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    names = set()
+    for line in res.stdout.decode(errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in "VAS":
+            names.add(parts[1])
+    return names
+
+
+ENCODERS = _ffmpeg_encoders()
+
+# códec -> etiqueta, CRF por defecto, rango de CRF, presets (rápido/medio/lento)
+VIDEO_CODECS = {
+    "libx265": ("H.265 / HEVC (más compresión; Firefox no lo reproduce)", 22, (14, 30),
+                {"fast": "fast", "medium": "medium", "slow": "slow"}),
+    "libsvtav1": ("AV1 / SVT-AV1 (máxima compresión; Firefox lo reproduce)", 28, (18, 40),
+                  {"fast": "10", "medium": "8", "slow": "6"}),
+    "libx264": ("H.264 / AVC (máxima compatibilidad)", 18, (14, 28),
+                {"fast": "fast", "medium": "medium", "slow": "slow"}),
+}
+
+
+def available_video_codecs() -> list[str]:
+    return [c for c in VIDEO_CODECS if c in ENCODERS]
 
 JPEG_EXTS = {".jpg", ".jpeg"}
 PNG_EXTS = {".png"}
@@ -31,7 +107,7 @@ class Options:
     jpeg_quality: int = 92  # solo en modo "visual"
     strip_redundant: bool = True  # comentarios, XMP, IPTC (EXIF con fecha/GPS se conserva)
     png_to_webp: bool = False
-    video_codec: str = "libx265"  # "libx265" | "libx264"
+    video_codec: str = "libx265"  # "libx265" | "libsvtav1" | "libx264"
     video_crf: int = 22
     video_preset: str = "medium"
     skip_hevc: bool = True
@@ -88,7 +164,7 @@ def _jpeg(src: Path, out: Path, opts: Options) -> str:
             img.save(out, "JPEG", quality=opts.jpeg_quality, optimize=True, progressive=True,
                      subsampling="keep", **params)
         return f"Pillow q{opts.jpeg_quality}"
-    raise RuntimeError("falta jpegoptim o jpegtran (sudo apt install jpegoptim)")
+    raise RuntimeError(f"falta jpegoptim o jpegtran ({install_cmd('jpegoptim')})")
 
 
 def _png(src: Path, out: Path, opts: Options) -> str:
@@ -157,14 +233,17 @@ class Skip(Exception):
 
 def _video(src: Path, out: Path, opts: Options) -> str:
     if not TOOLS["ffmpeg"]:
-        raise RuntimeError("falta ffmpeg (sudo apt install ffmpeg)")
+        raise RuntimeError(f"falta ffmpeg ({install_cmd('ffmpeg')})")
+    if opts.video_codec not in ENCODERS:
+        raise RuntimeError(f"este ffmpeg no incluye el codificador {opts.video_codec}")
     info = probe_video(src)
     if info.get("transfer") in HDR_TRANSFERS:
         raise Skip("vídeo HDR: se deja intacto para no perder el rango dinámico")
     if opts.skip_hevc and info.get("codec") in ("hevc", "av1", "vp9"):
         raise Skip(f"ya está en {info['codec'].upper()} (códec eficiente)")
 
-    codec_args = ["-c:v", opts.video_codec, "-crf", str(opts.video_crf), "-preset", opts.video_preset]
+    preset = VIDEO_CODECS[opts.video_codec][3].get(opts.video_preset, opts.video_preset)
+    codec_args = ["-c:v", opts.video_codec, "-crf", str(opts.video_crf), "-preset", preset]
     if opts.video_codec == "libx265":
         codec_args += ["-x265-params", "log-level=error"]
         if out.suffix in (".mp4", ".mov", ".m4v"):
@@ -179,20 +258,29 @@ def _video(src: Path, out: Path, opts: Options) -> str:
                 "-map_metadata", "0", *mux_args, str(out)]
         return _run(cmd)
 
-    audio_copy, audio_aac = ["-c:a", "copy"], ["-c:a", "aac", "-b:a", "192k"]
-    same_container = out.suffix == src.suffix.lower()
-    res = encode(False, audio_copy) if same_container else None
-    audio_note = "audio copiado"
-    if res is None or res.returncode != 0:  # cambio de contenedor o audio no admitido: AAC
-        res = encode(False, audio_aac)
-        audio_note = "audio AAC 192k"
+    # Audio: copiarlo tal cual; si no se puede (o cambia el contenedor), AAC y, si este
+    # ffmpeg no trae AAC, Opus.
+    audio_options = []
+    if out.suffix == src.suffix.lower():
+        audio_options.append((["-c:a", "copy"], "audio copiado"))
+    if "aac" in ENCODERS:
+        audio_options.append((["-c:a", "aac", "-b:a", "192k"], "audio AAC 192k"))
+    if "libopus" in ENCODERS:
+        audio_options.append((["-c:a", "libopus", "-b:a", "160k"], "audio Opus 160k"))
+    if not audio_options:
+        audio_options.append((["-c:a", "copy"], "audio copiado"))
+    res = None
+    for audio, audio_note in audio_options:
+        res = encode(False, audio)
+        if res.returncode == 0:
+            break
     if res.returncode != 0:
         raise RuntimeError(f"ffmpeg: {_err(res)}")
 
     # Verificar rotación: si esta versión de ffmpeg perdió la etiqueta, se gira la imagen
     out_info = probe_video(out)
     if info and out_info and out_info.get("rotation") != info.get("rotation"):
-        res = encode(True, audio_copy if audio_note == "audio copiado" else audio_aac)
+        res = encode(True, audio)
         if res.returncode != 0:
             raise RuntimeError(f"ffmpeg: {_err(res)}")
 
@@ -247,7 +335,8 @@ def compress_file(src: Path, tmp_dir: Path, opts: Options, tag: str) -> dict:
             if not candidates:
                 raise Skip("activa «Convertir a WebP sin pérdida» para este formato")
         elif ext in VIDEO_EXTS:
-            out = tmp_dir / f"{tag}{ext if ext in VIDEO_KEEP_CONTAINER else '.mp4'}"
+            keep = VIDEO_KEEP_CONTAINER - ({".mov"} if opts.video_codec == "libsvtav1" else set())
+            out = tmp_dir / f"{tag}{ext if ext in keep else '.mp4'}"
             candidates.append((out, _video(src, out, opts)))
         else:
             raise Skip("formato no soportado")
@@ -295,3 +384,42 @@ def video_duration(path: Path) -> float:
         return float(res.stdout.decode().strip())
     except ValueError:
         return 0.0
+
+
+# --------------------------------------------------------------------------
+# Vista previa para el navegador (Firefox no reproduce HEVC, AVI ni MKV H.264)
+# --------------------------------------------------------------------------
+PREVIEW_DIR = Path.home() / ".cache" / "limpiador-galeria" / "previews"
+
+
+def preview_path(src: Path) -> Path:
+    stt = src.stat()
+    key = hashlib.md5(f"{src.resolve()}|{stt.st_size}|{stt.st_mtime}".encode()).hexdigest()
+    return PREVIEW_DIR / f"{key}.webm"
+
+
+def can_make_preview() -> bool:
+    return "libvpx-vp9" in ENCODERS
+
+
+def make_browser_preview(src: Path) -> Path:
+    """Crea (una vez) una copia WebM/VP9 a 720p, reproducible en cualquier navegador."""
+    out = preview_path(src)
+    if out.exists():
+        return out
+    if not can_make_preview():
+        raise RuntimeError("este ffmpeg no incluye el codificador VP9 (libvpx-vp9)")
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    part = out.with_suffix(".part.webm")
+    audio = ["-c:a", "libopus", "-b:a", "96k"] if "libopus" in ENCODERS else ["-an"]
+    res = _run([
+        TOOLS["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(src),
+        "-map", "0:v:0", "-map", "0:a?", "-vf", "scale=-2:'min(720,ih)'",
+        "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1",
+        "-b:v", "2M", *audio, str(part),
+    ])
+    if res.returncode != 0:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg: {_err(res)}")
+    part.rename(out)
+    return out
