@@ -2,3 +2,5 @@ streamlit>=1.60
 pillow>=10.0
 folium>=0.17
 streamlit-folium>=0.22
+imagehash>=4.3
+numpy>=1.24

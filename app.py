@@ -1,4 +1,4 @@
-"""Limpiador de Galería: organiza fotos por Proyecto / Categoría con Streamlit.
+"""Limpiador de Galería: organiza fotos y vídeos por Proyecto / Categoría con Streamlit.
 
 Estructura de salida:
     <destino_base>/<Proyecto>/<Categoría>/...
@@ -8,15 +8,19 @@ Estructura de salida:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 from datetime import date, datetime, time
 from io import BytesIO
 from pathlib import Path
 
 import folium
+import imagehash
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageOps
 from streamlit_folium import st_folium
@@ -30,7 +34,10 @@ DEFAULT_BASE = str(Path.home() / "Fotos_Organizadas")
 DEFAULT_CATEGORIES = ["Playa", "Familia", "Salidas_Comida"]
 CONFIG_PATH = Path.home() / ".config" / "limpiador-galeria" / "config.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".gif"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".webm"}
 DISPLAY_MAX = (1800, 820)  # tamaño máximo de la imagen en el visor
+THUMB_MAX = (480, 360)  # miniaturas de la vista de similares
+EXIFTOOL = shutil.which("exiftool")
 
 # Soporte opcional para fotos HEIC/HEIF de móviles (pip install pillow-heif)
 try:
@@ -40,6 +47,7 @@ try:
     IMAGE_EXTS |= {".heic", ".heif"}
 except ImportError:
     pass
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
 # Tags EXIF
 TAG_EXIF_IFD = 0x8769
@@ -173,7 +181,7 @@ def _dms_to_deg(dms, ref) -> float | None:
     return deg
 
 
-@st.cache_data(show_spinner=False, max_entries=500)
+@st.cache_data(show_spinner=False, max_entries=5000)
 def read_metadata(path: str, mtime: float) -> dict:
     meta = {"date": None, "width": None, "height": None, "camera": None, "gps": None}
     try:
@@ -221,6 +229,123 @@ def display_bytes(path: str, mtime: float) -> bytes | None:
         return None
 
 
+@st.cache_data(show_spinner=False, max_entries=5000)
+def thumb_bytes(path: str, mtime: float) -> bytes | None:
+    """Miniatura orientada para la vista de similares."""
+    try:
+        with Image.open(path) as img:
+            img.draft("RGB", (THUMB_MAX[0] * 2, THUMB_MAX[1] * 2))
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail(THUMB_MAX)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=82)
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Vídeos: metadatos con exiftool (los vídeos guardan fecha/GPS en átomos
+# QuickTime/MP4, no en EXIF)
+# --------------------------------------------------------------------------
+EXIFTOOL_TAGS = [
+    "-DateTimeOriginal", "-CreationDate", "-CreateDate", "-MediaCreateDate",
+    "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates",
+    "-ImageWidth", "-ImageHeight", "-Rotation", "-Duration",
+    "-Make", "-Model", "-AndroidModel", "-AndroidMake",
+]
+
+
+def is_video(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXTS
+
+
+def _run_exiftool(paths: list[Path]) -> dict[str, dict]:
+    """Ejecuta exiftool una sola vez para varios archivos y devuelve {ruta: tags}."""
+    if not EXIFTOOL or not paths:
+        return {}
+    cmd = [
+        EXIFTOOL, "-json", "-n", "-api", "QuickTimeUTC=1", "-charset", "filename=utf8",
+        *EXIFTOOL_TAGS, "--", *map(str, paths),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=60 + 2 * len(paths), check=False)
+        data = json.loads(res.stdout.decode("utf-8", errors="replace") or "[]")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {}
+    return {d.get("SourceFile"): d for d in data if isinstance(d, dict)}
+
+
+def _parse_video_meta(raw: dict) -> dict:
+    meta = {"date": None, "width": None, "height": None, "camera": None, "gps": None, "duration": None}
+    # CreationDate (iPhone) ya incluye zona horaria; CreateDate se convierte desde UTC
+    for tag in ("DateTimeOriginal", "CreationDate", "CreateDate", "MediaCreateDate"):
+        dt = _parse_exif_date(raw.get(tag))
+        if dt and dt.year > 1970:
+            meta["date"] = dt.isoformat()
+            break
+    lat, lon = _to_float(raw.get("GPSLatitude")), _to_float(raw.get("GPSLongitude"))
+    if (lat != lat or lon != lon) and raw.get("GPSCoordinates"):
+        parts = re.split(r"[\s,]+", str(raw["GPSCoordinates"]).strip())
+        if len(parts) >= 2:
+            lat, lon = _to_float(parts[0]), _to_float(parts[1])
+    if lat == lat and lon == lon and not (lat == 0 and lon == 0) and abs(lat) <= 90 and abs(lon) <= 180:
+        meta["gps"] = (lat, lon)
+    w, h = raw.get("ImageWidth"), raw.get("ImageHeight")
+    if isinstance(w, (int, float)) and isinstance(h, (int, float)) and w and h:
+        if int(_to_float(raw.get("Rotation")) or 0) in (90, 270):
+            w, h = h, w
+        meta["width"], meta["height"] = int(w), int(h)
+    dur = _to_float(raw.get("Duration"))
+    meta["duration"] = dur if dur == dur else None
+    make = str(raw.get("Make") or raw.get("AndroidMake") or "").strip()
+    model = str(raw.get("Model") or raw.get("AndroidModel") or "").strip()
+    if model and make and model.lower().startswith(make.lower()):
+        make = ""
+    meta["camera"] = " ".join(x for x in (make, model) if x) or None
+    return meta
+
+
+@st.cache_resource
+def _video_meta_cache() -> dict:
+    return {}
+
+
+def video_metadata_batch(paths: list[Path], progress=None) -> dict[str, dict]:
+    """Metadatos de varios vídeos, en lotes de 100 para no lanzar un proceso por archivo."""
+    cache = _video_meta_cache()
+    out, missing = {}, []
+    for p in paths:
+        k = (str(p), p.stat().st_mtime)
+        if k in cache:
+            out[str(p)] = cache[k]
+        else:
+            missing.append(p)
+    for i in range(0, len(missing), 100):
+        chunk = missing[i : i + 100]
+        if progress:
+            progress.progress(i / len(missing), text=f"Leyendo metadatos de vídeos… {i}/{len(missing)}")
+        raw = _run_exiftool(chunk)
+        for p in chunk:
+            meta = _parse_video_meta(raw.get(str(p), {}))
+            if EXIFTOOL:  # sin exiftool no se cachea, por si se instala después
+                cache[(str(p), p.stat().st_mtime)] = meta
+            out[str(p)] = meta
+    return out
+
+
+def read_video_metadata(path: str) -> dict:
+    return video_metadata_batch([Path(path)])[str(path)]
+
+
+def open_with_system(path: str) -> None:
+    opener = shutil.which("xdg-open")
+    if opener:
+        subprocess.Popen([opener, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # --------------------------------------------------------------------------
 # Escaneo de la carpeta de origen y construcción de la cola de revisión
 # --------------------------------------------------------------------------
@@ -230,7 +355,7 @@ def scan_source(proj: dict) -> list[dict]:
     walker = src.rglob("*") if proj.get("recursive", True) else src.glob("*")
     files = []
     for p in walker:
-        if p.suffix.lower() not in IMAGE_EXTS or not p.is_file():
+        if p.suffix.lower() not in MEDIA_EXTS or not p.is_file():
             continue
         rp = p.resolve()
         if rp == exclude or exclude in rp.parents:  # no re-escanear lo ya organizado
@@ -241,8 +366,12 @@ def scan_source(proj: dict) -> list[dict]:
     d_to = date.fromisoformat(proj["date_to"]) if proj.get("date_to") else None
     out = []
     progress = st.progress(0.0, text="Leyendo fechas EXIF…") if len(files) > 50 else None
+    videos = video_metadata_batch([p for p in files if is_video(p)], progress)
     for i, p in enumerate(files):
-        dt_iso = read_capture_date(str(p), p.stat().st_mtime)
+        if is_video(p):
+            dt_iso = videos[str(p)]["date"]
+        else:
+            dt_iso = read_capture_date(str(p), p.stat().st_mtime)
         dt = datetime.fromisoformat(dt_iso) if dt_iso else None
         if dt is None:
             if (d_from or d_to) and not proj.get("include_undated", True):
@@ -562,16 +691,28 @@ def sidebar_metadata(item: dict) -> None:
         sb.warning("Archivo no encontrado.")
         return
     stat = path.stat()
-    meta = read_metadata(str(path), stat.st_mtime)
+    video = is_video(path)
+    if video:
+        meta = read_video_metadata(str(path))
+        if not EXIFTOOL:
+            sb.warning(
+                "Para leer fecha y GPS de vídeos instala exiftool:\n\n"
+                "`sudo apt install libimage-exiftool-perl`"
+            )
+    else:
+        meta = read_metadata(str(path), stat.st_mtime)
     if meta["date"]:
         dt = datetime.fromisoformat(meta["date"])
         sb.markdown(f"**📅 Captura:** {dt.strftime('%d/%m/%Y %H:%M:%S')}")
     else:
-        sb.markdown("**📅 Captura:** _sin fecha EXIF_")
+        sb.markdown(f"**📅 Captura:** _sin fecha {'en metadatos' if video else 'EXIF'}_")
     sb.markdown(f"**📄 Archivo original:** `{Path(item['key']).name}`")
     if meta["width"]:
         mp = meta["width"] * meta["height"] / 1e6
         sb.markdown(f"**🖼️ Resolución:** {meta['width']} × {meta['height']} px ({mp:.1f} MP)")
+    if meta.get("duration"):
+        mins, secs = divmod(int(round(meta["duration"])), 60)
+        sb.markdown(f"**⏱️ Duración:** {mins}:{secs:02d}")
     sb.markdown(f"**💾 Tamaño:** {stat.st_size / (1024 * 1024):.2f} MB")
     if meta["camera"]:
         sb.markdown(f"**📷 Cámara:** {meta['camera']}")
@@ -590,6 +731,213 @@ def sidebar_metadata(item: dict) -> None:
         sb.info("📍 Sin datos de geolocalización")
 
 
+VIDEO_MIME = {".webm": "video/webm", ".mkv": "video/webm", ".avi": "video/x-msvideo"}
+VIDEO_EMBED_MAX_MB = 500  # por encima se pide confirmación (st.video carga el archivo en memoria)
+
+
+def video_player(path: Path) -> None:
+    size_mb = path.stat().st_size / (1024 * 1024)
+    _, mid, _ = st.columns([1, 10, 1])
+    with mid:
+        embed = size_mb <= VIDEO_EMBED_MAX_MB or st.checkbox(
+            f"Vídeo grande ({size_mb:.0f} MB): cargar en el navegador de todos modos",
+            key=f"bigvid_{path}",
+        )
+        if embed:
+            st.markdown(
+                "<style>[data-testid='stVideo']{max-height:72vh}</style>", unsafe_allow_html=True
+            )
+            st.video(str(path), format=VIDEO_MIME.get(path.suffix.lower(), "video/mp4"))
+        c1, c2 = st.columns([3, 1], vertical_alignment="center")
+        c1.caption(
+            "Si el vídeo no se reproduce (AVI, algunos MKV o HEVC/H.265 de iPhone), "
+            "ábrelo con el reproductor del sistema."
+        )
+        if c2.button("▶️ Abrir en reproductor", width="stretch", key="open_sys"):
+            open_with_system(str(path))
+
+
+# --------------------------------------------------------------------------
+# Limpieza de similares (perceptual hashing)
+# --------------------------------------------------------------------------
+HASH_FUNCS = {"phash": imagehash.phash, "dhash": imagehash.dhash}
+GROUPS_PER_PAGE = 5
+
+
+@st.cache_data(show_spinner=False, max_entries=50000)
+def image_hash(path: str, mtime: float, algo: str) -> str | None:
+    try:
+        with Image.open(path) as img:
+            img.draft("RGB", (512, 512))  # acelera mucho la decodificación de JPEG grandes
+            img = ImageOps.exif_transpose(img)
+            return str(HASH_FUNCS[algo](img))
+    except Exception:
+        return None
+
+
+def _popcount(arr: np.ndarray) -> np.ndarray:
+    if hasattr(np, "bitwise_count"):
+        return np.bitwise_count(arr)
+    return np.unpackbits(arr.view(np.uint8)).reshape(-1, 64).sum(axis=1)
+
+
+def group_similar(hashes: list[str], threshold: int) -> list[list[int]]:
+    """Agrupa índices cuyos hashes están a distancia Hamming <= threshold (enlace simple)."""
+    n = len(hashes)
+    if n < 2:
+        return []
+    arr = np.array([int(h, 16) for h in hashes], dtype=np.uint64)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n - 1):
+        dist = _popcount(arr[i + 1 :] ^ arr[i])
+        for j in np.nonzero(dist <= threshold)[0]:
+            ri, rj = find(i), find(i + 1 + int(j))
+            if ri != rj:
+                parent[rj] = ri
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def _wkey(key: str) -> str:
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def apply_group(proj: dict, group: list[dict], keep: set[str], category: str) -> list[str]:
+    """Conserva `keep` en `category` (las ya clasificadas se quedan donde están) y descarta el resto."""
+    errors = []
+    for it in group:
+        dec = it.get("decision")
+        if it["key"] in keep:
+            if dec and dec["category"] != DISCARD_DIR:
+                continue
+            target = category
+        else:
+            target = DISCARD_DIR
+        try:
+            classify(proj, it, target)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{Path(it['key']).name}: {e}")
+    return errors
+
+
+def similar_view(proj: dict, items: list[dict]) -> None:
+    st.subheader("🧬 Limpieza de similares")
+    st.caption(
+        "Detecta clones y ráfagas comparando el *hash perceptual* de cada foto. "
+        "Umbral 0 = idénticas; 4-6 = ráfagas casi iguales; 8-10 = parecidas."
+    )
+    cats = proj["categories"]
+    c1, c2, c3, c4 = st.columns([2, 3, 2, 2], vertical_alignment="bottom")
+    algo = c1.selectbox("Algoritmo", list(HASH_FUNCS), key="sim_algo",
+                        help="phash es más robusto; dhash es más rápido y estricto con ráfagas.")
+    threshold = c2.slider("Tolerancia (distancia Hamming)", 0, 10, 5, key="sim_thr")
+    include_done = c3.checkbox("Incluir ya clasificadas", value=False, key="sim_done",
+                               help="Por defecto solo se comparan las fotos pendientes.")
+    default_cat = ss.get("last_cat", cats[0])
+    keep_cat = c4.selectbox("Conservar en", cats, key="sim_cat",
+                            index=cats.index(default_cat) if default_cat in cats else 0)
+
+    cands = [
+        it for it in items
+        if not is_video(it["path"])
+        and (not it.get("decision") or (include_done and it["decision"]["category"] != DISCARD_DIR))
+        and Path(it["path"]).exists()
+    ]
+    if len(cands) < 2:
+        st.info("No hay suficientes fotos para comparar.")
+        return
+
+    progress = st.progress(0.0, text="Calculando hashes…") if len(cands) > 30 else None
+    hashed = []
+    for i, it in enumerate(cands):
+        h = image_hash(it["path"], Path(it["path"]).stat().st_mtime, algo)
+        if h:
+            hashed.append((it, h))
+        if progress and i % 20 == 0:
+            progress.progress(i / len(cands), text=f"Calculando hashes… {i}/{len(cands)}")
+    if progress:
+        progress.empty()
+
+    ignored = {frozenset(g) for g in proj.get("similar_ignored", [])}
+    groups = []
+    for g in group_similar([h for _, h in hashed], threshold):
+        members = [hashed[i][0] for i in g]
+        if frozenset(m["key"] for m in members) not in ignored:
+            groups.append(members)
+
+    if not groups:
+        st.success(f"✨ No se encontraron fotos similares entre {len(hashed)} fotos con tolerancia {threshold}.")
+        return
+
+    n_pages = (len(groups) - 1) // GROUPS_PER_PAGE + 1
+    p1, p2 = st.columns([3, 1], vertical_alignment="bottom")
+    p1.markdown(f"**{len(groups)} grupos** · {sum(map(len, groups))} fotos implicadas")
+    page = p2.number_input("Página", 1, n_pages, 1, key="sim_page") if n_pages > 1 else 1
+
+    for gi, group in enumerate(groups[(page - 1) * GROUPS_PER_PAGE : page * GROUPS_PER_PAGE]):
+        gid = _wkey("|".join(sorted(m["key"] for m in group)))
+        metas = {}
+        for m in group:
+            stt = Path(m["path"]).stat()
+            metas[m["key"]] = (read_metadata(m["path"], stt.st_mtime), stt.st_size)
+        best = max(group, key=lambda m: ((metas[m["key"]][0]["width"] or 0) * (metas[m["key"]][0]["height"] or 0),
+                                        metas[m["key"]][1]))
+        with st.container(border=True):
+            st.markdown(f"**Grupo {(page - 1) * GROUPS_PER_PAGE + gi + 1}** · {len(group)} fotos")
+            keep = set()
+            per_row = min(len(group), 4)
+            for row in range(0, len(group), per_row):
+                cols = st.columns(per_row)
+                for col, m in zip(cols, group[row : row + per_row]):
+                    meta, size = metas[m["key"]]
+                    with col:
+                        thumb = thumb_bytes(m["path"], Path(m["path"]).stat().st_mtime)
+                        if thumb:
+                            st.image(thumb, width="stretch")
+                        dt = (datetime.fromisoformat(meta["date"]).strftime("%d/%m/%Y %H:%M:%S")
+                              if meta["date"] else "sin fecha")
+                        dec = m.get("decision")
+                        estado = f" · 📁 {dec['category']}" if dec else ""
+                        res = f"{meta['width']}×{meta['height']}" if meta["width"] else "?"
+                        st.caption(
+                            f"`{Path(m['key']).name}`{estado}  \n"
+                            f"🖼️ {res} · 💾 {size / (1024 * 1024):.2f} MB  \n📅 {dt}"
+                            + ("  \n⭐ **Mejor calidad**" if m is best else "")
+                        )
+                        if st.checkbox("Conservar", value=m is best, key=f"keep_{gid}_{_wkey(m['key'])}"):
+                            keep.add(m["key"])
+                        if st.button("⭐ Solo esta", key=f"only_{gid}_{_wkey(m['key'])}", width="stretch",
+                                     help=f"Conservar esta en «{keep_cat}» y descartar las demás del grupo"):
+                            ss.last_cat = keep_cat
+                            errs = apply_group(proj, group, {m["key"]}, keep_cat)
+                            ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto")
+                            st.rerun()
+            b1, b2 = st.columns([3, 1])
+            n_disc = len(group) - len(keep)
+            if b1.button(
+                f"✅ Conservar {len(keep)} en «{keep_cat}» y descartar {n_disc}",
+                key=f"apply_{gid}", type="primary", width="stretch", disabled=not keep,
+            ):
+                ss.last_cat = keep_cat
+                errs = apply_group(proj, group, keep, keep_cat)
+                ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto")
+                st.rerun()
+            if b2.button("🙈 No son duplicadas", key=f"ign_{gid}", width="stretch",
+                         help="Ocultar este grupo en el futuro"):
+                proj.setdefault("similar_ignored", []).append(sorted(m["key"] for m in group))
+                save_project(proj)
+                st.rerun()
+
+
 def stats_header(proj: dict, items: list[dict]) -> None:
     total = len(items)
     reviewed = sum(1 for it in items if "decision" in it)
@@ -603,9 +951,14 @@ def stats_header(proj: dict, items: list[dict]) -> None:
         col.metric(("🗑️ Descartadas" if cat == DISCARD_DIR else f"📁 {cat}"), n)
 
 
-def review_screen() -> None:
+def project_screen() -> None:
     proj = ss.project
     sidebar_project(proj)
+    view = st.sidebar.segmented_control(
+        "Vista", ["revision", "similares"], default="revision", key="view", required=True,
+        format_func=lambda v: "🖼️ Revisión" if v == "revision" else "🧬 Similares",
+        width="stretch",
+    ) or "revision"
 
     if ss.flash:
         kind, msg = ss.flash
@@ -624,9 +977,16 @@ def review_screen() -> None:
     stats_header(proj, items)
 
     if not items:
-        st.info("No se encontraron fotos en la carpeta de origen con los filtros actuales.")
+        st.info("No se encontraron fotos ni vídeos en la carpeta de origen con los filtros actuales.")
         return
 
+    if view == "similares":
+        similar_view(proj, items)
+    else:
+        review_view(proj, items)
+
+
+def review_view(proj: dict, items: list[dict]) -> None:
     if ss.pop("jump_to_pending", False):
         np_ = next_pending(items, 0)
         ss.idx = np_ if np_ is not None else 0
@@ -649,7 +1009,8 @@ def review_screen() -> None:
         if decision else "⏳ Pendiente"
     )
     nav[2].markdown(
-        f"<div style='text-align:center'><b>Foto {ss.idx + 1} / {len(items)}</b> · "
+        f"<div style='text-align:center'><b>{'🎬 Vídeo' if is_video(item['path']) else 'Foto'} "
+        f"{ss.idx + 1} / {len(items)}</b> · "
         f"<code>{Path(item['key']).name}</code> · {status}</div>",
         unsafe_allow_html=True,
     )
@@ -666,8 +1027,9 @@ def review_screen() -> None:
 
     # ---- Visor ----
     path = Path(item["path"])
-    data = display_bytes(str(path), path.stat().st_mtime) if path.exists() else None
-    if data:
+    if path.exists() and is_video(path):
+        video_player(path)
+    elif (data := display_bytes(str(path), path.stat().st_mtime) if path.exists() else None):
         _, mid, _ = st.columns([1, 10, 1])
         with mid:
             st.markdown(
@@ -742,4 +1104,4 @@ if ss.flash and ss.flash[0] == "toast":
 if ss.project is None:
     setup_screen()
 else:
-    review_screen()
+    project_screen()
