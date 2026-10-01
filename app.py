@@ -8,12 +8,14 @@ Estructura de salida:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import unicodedata
 from datetime import date, datetime, time
 from io import BytesIO
 from pathlib import Path
@@ -21,9 +23,13 @@ from pathlib import Path
 import folium
 import imagehash
 import numpy as np
+import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from streamlit_folium import st_folium
+
+import compresion as comp
 
 # --------------------------------------------------------------------------
 # Constantes
@@ -412,10 +418,33 @@ def unique_path(target: Path) -> Path:
     stem, suffix = target.stem, target.suffix
     n = 1
     while True:
-        cand = target.with_name(f"{stem}_{n}{suffix}")
+        cand = target.with_name(f"{stem}_{n:03d}{suffix}")
         if not cand.exists():
             return cand
         n += 1
+
+
+def _abbr(text: str) -> str:
+    """Tres primeras letras/dígitos en mayúsculas, sin tildes (Vacaciones_2025 -> VAC)."""
+    plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return (re.sub(r"[^0-9A-Za-z]", "", plain)[:3] or "XXX").upper()
+
+
+def capture_stamp(item: dict) -> str:
+    """YYYYMMDD_HHMMSS de la fecha de captura; si no hay, de st_mtime; si no, SINFECHA_hoy."""
+    if item.get("date"):
+        return datetime.fromisoformat(item["date"]).strftime("%Y%m%d_%H%M%S")
+    try:
+        return datetime.fromtimestamp(Path(item["path"]).stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+    except (OSError, ValueError):
+        return "SINFECHA_" + date.today().strftime("%Y%m%d")
+
+
+def standard_name(proj: dict, item: dict, category: str) -> str:
+    """[PRO]_[CAT]_[FECHA].ext  (el sufijo _001, _002… lo añade unique_path si hay colisión)."""
+    cat = "DSC" if category == DISCARD_DIR else _abbr(category)
+    ext = Path(item["path"]).suffix.lower()
+    return f"{_abbr(proj['name'])}_{cat}_{capture_stamp(item)}{ext}"
 
 
 def classify(proj: dict, item: dict, category: str) -> None:
@@ -423,16 +452,17 @@ def classify(proj: dict, item: dict, category: str) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     prev = item.get("decision")
     current = Path(item["path"])
+    new_name = standard_name(proj, item, category)
 
-    if prev:  # reclasificación: se mueve el archivo que ya está en el proyecto
+    if prev:  # reclasificación: se mueve (y renombra) el archivo que ya está en el proyecto
         if prev["category"] == category:
             return
         if not current.exists():
             raise FileNotFoundError(f"No se encuentra {current}")
-        dest = unique_path(folder / current.name)
+        dest = unique_path(folder / new_name)
         shutil.move(str(current), str(dest))
     else:
-        dest = unique_path(folder / current.name)
+        dest = unique_path(folder / new_name)
         if proj["mode"] == "mover":
             shutil.move(str(current), str(dest))
         else:
@@ -480,6 +510,7 @@ def open_project(proj: dict) -> None:
     ss.scan = None
     ss.idx = 0
     ss.jump_to_pending = True
+    ss["_goto_view"] = "revision" if proj.get("similar_done") else "similares"
     ensure_category_dirs(proj)
     gcfg["last_base"] = proj["base_dest"]
     gcfg["last_project"] = proj["name"]
@@ -707,6 +738,8 @@ def sidebar_metadata(item: dict) -> None:
     else:
         sb.markdown(f"**📅 Captura:** _sin fecha {'en metadatos' if video else 'EXIF'}_")
     sb.markdown(f"**📄 Archivo original:** `{Path(item['key']).name}`")
+    if item.get("decision"):
+        sb.markdown(f"**🏷️ Nombre final:** `{path.name}`")
     if meta["width"]:
         mp = meta["width"] * meta["height"] / 1e6
         sb.markdown(f"**🖼️ Resolución:** {meta['width']} × {meta['height']} px ({mp:.1f} MP)")
@@ -811,40 +844,41 @@ def _wkey(key: str) -> str:
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def apply_group(proj: dict, group: list[dict], keep: set[str], category: str) -> list[str]:
-    """Conserva `keep` en `category` (las ya clasificadas se quedan donde están) y descarta el resto."""
+def apply_group(proj: dict, group: list[dict], keep: set[str]) -> list[str]:
+    """Descarta las fotos del grupo que no están en `keep`.
+
+    Las conservadas no se mueven: siguen pendientes para clasificarlas en la revisión.
+    """
     errors = []
     for it in group:
-        dec = it.get("decision")
         if it["key"] in keep:
-            if dec and dec["category"] != DISCARD_DIR:
-                continue
-            target = category
-        else:
-            target = DISCARD_DIR
+            continue
         try:
-            classify(proj, it, target)
+            classify(proj, it, DISCARD_DIR)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{Path(it['key']).name}: {e}")
     return errors
 
 
 def similar_view(proj: dict, items: list[dict]) -> None:
-    st.subheader("🧬 Limpieza de similares")
+    h1, h2 = st.columns([3, 1], vertical_alignment="center")
+    h1.subheader("1️⃣ Limpieza de similares")
+    if h2.button("Terminar y pasar a revisión ➡️", type="primary", width="stretch",
+                 help="Marca este paso como hecho; puedes volver cuando quieras"):
+        proj["similar_done"] = True
+        save_project(proj)
+        go_to("revision")
     st.caption(
-        "Detecta clones y ráfagas comparando el *hash perceptual* de cada foto. "
-        "Umbral 0 = idénticas; 4-6 = ráfagas casi iguales; 8-10 = parecidas."
+        "Primer paso: quédate con la mejor foto de cada ráfaga o clon y descarta el resto. "
+        "Las que conserves siguen **pendientes** para clasificarlas en la revisión. "
+        "Tolerancia 0 = idénticas; 4-6 = ráfagas casi iguales; 8-10 = parecidas."
     )
-    cats = proj["categories"]
-    c1, c2, c3, c4 = st.columns([2, 3, 2, 2], vertical_alignment="bottom")
+    c1, c2, c3 = st.columns([2, 3, 2], vertical_alignment="bottom")
     algo = c1.selectbox("Algoritmo", list(HASH_FUNCS), key="sim_algo",
                         help="phash es más robusto; dhash es más rápido y estricto con ráfagas.")
     threshold = c2.slider("Tolerancia (distancia Hamming)", 0, 10, 5, key="sim_thr")
     include_done = c3.checkbox("Incluir ya clasificadas", value=False, key="sim_done",
                                help="Por defecto solo se comparan las fotos pendientes.")
-    default_cat = ss.get("last_cat", cats[0])
-    keep_cat = c4.selectbox("Conservar en", cats, key="sim_cat",
-                            index=cats.index(default_cat) if default_cat in cats else 0)
 
     cands = [
         it for it in items
@@ -916,19 +950,17 @@ def similar_view(proj: dict, items: list[dict]) -> None:
                         if st.checkbox("Conservar", value=m is best, key=f"keep_{gid}_{_wkey(m['key'])}"):
                             keep.add(m["key"])
                         if st.button("⭐ Solo esta", key=f"only_{gid}_{_wkey(m['key'])}", width="stretch",
-                                     help=f"Conservar esta en «{keep_cat}» y descartar las demás del grupo"):
-                            ss.last_cat = keep_cat
-                            errs = apply_group(proj, group, {m["key"]}, keep_cat)
+                                     help="Conservar esta y descartar las demás del grupo"):
+                            errs = apply_group(proj, group, {m["key"]})
                             ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto")
                             st.rerun()
             b1, b2 = st.columns([3, 1])
             n_disc = len(group) - len(keep)
             if b1.button(
-                f"✅ Conservar {len(keep)} en «{keep_cat}» y descartar {n_disc}",
-                key=f"apply_{gid}", type="primary", width="stretch", disabled=not keep,
+                f"✅ Conservar {len(keep)} y descartar {n_disc}",
+                key=f"apply_{gid}", type="primary", width="stretch", disabled=not keep or not n_disc,
             ):
-                ss.last_cat = keep_cat
-                errs = apply_group(proj, group, keep, keep_cat)
+                errs = apply_group(proj, group, keep)
                 ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto")
                 st.rerun()
             if b2.button("🙈 No son duplicadas", key=f"ign_{gid}", width="stretch",
@@ -936,6 +968,395 @@ def similar_view(proj: dict, items: list[dict]) -> None:
                 proj.setdefault("similar_ignored", []).append(sorted(m["key"] for m in group))
                 save_project(proj)
                 st.rerun()
+
+
+# --------------------------------------------------------------------------
+# 3. Optimización y compresión (opcional)
+# --------------------------------------------------------------------------
+OPT_DIR = ".optimizacion_tmp"  # dentro del proyecto: mismo disco, reemplazo atómico
+OPT_RESULTS = "resultados.json"
+CMP_MAX = (1000, 650)  # tamaño del comparador antes/después
+MB = 1024 * 1024
+STATUS_LABELS = {
+    "ok": "✅ Reducido", "sin_ahorro": "➖ Sin ahorro (se conserva)",
+    "omitido": "⏭️ Omitido", "error": "❌ Error",
+}
+
+
+def fmt_size(n: float) -> str:
+    for unit in ("B", "KB", "MB"):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.2f} GB"
+
+
+def opt_dir(proj: dict) -> Path:
+    return project_dir(proj) / OPT_DIR
+
+
+def load_opt_run(proj: dict) -> dict | None:
+    try:
+        return json.loads((opt_dir(proj) / OPT_RESULTS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def save_opt_run(proj: dict, run: dict) -> None:
+    opt_dir(proj).mkdir(parents=True, exist_ok=True)
+    atomic_write_json(opt_dir(proj) / OPT_RESULTS, run)
+
+
+def discard_opt_run(proj: dict) -> None:
+    shutil.rmtree(opt_dir(proj), ignore_errors=True)
+
+
+def files_in_scope(proj: dict, cats: set[str], kinds: set[str], reprocess: bool) -> list[dict]:
+    """Archivos ya organizados (dentro del proyecto) que se pueden comprimir."""
+    optimized = proj.get("optimized", {})
+    out = []
+    for d in proj["decisions"].values():
+        p = Path(d["dest"])
+        if d["category"] not in cats or not p.is_file() or not comp.is_compressible(p):
+            continue
+        if comp.media_kind(p) not in kinds:
+            continue
+        size = p.stat().st_size
+        if not reprocess and optimized.get(str(p)) == size:
+            continue  # ya optimizado y sin cambios desde entonces
+        out.append({"path": str(p), "category": d["category"], "size": size, "kind": comp.media_kind(p)})
+    return sorted(out, key=lambda f: f["path"])
+
+
+def process_opt_run(proj: dict, run: dict) -> None:
+    """Procesa la cola guardando tras cada archivo (si se interrumpe, se puede continuar)."""
+    opts = comp.Options(**run["options"])
+    total = len(run["queue"])
+    pending = [p for p in run["queue"] if p not in run["results"]]
+    bar = st.progress(0.0)
+    for src in pending:
+        done = len(run["results"])
+        bar.progress(done / total, text=f"Comprimiendo {done + 1}/{total}: {Path(src).name}…")
+        srcp = Path(src)
+        if srcp.is_file():
+            res = comp.compress_file(srcp, opt_dir(proj), opts, tag=f"{done:05d}")
+        else:
+            res = {"src": src, "orig_size": 0, "orig_mtime": 0, "kind": comp.media_kind(srcp), "tmp": None,
+                   "new_size": 0, "new_ext": srcp.suffix.lower(), "tool": "", "status": "error",
+                   "msg": "el archivo ya no existe"}
+        run["results"][src] = res
+        save_opt_run(proj, run)
+    bar.empty()
+
+
+def apply_opt_run(proj: dict, run: dict, selected: set[str]) -> tuple[int, int, list[str]]:
+    """Reemplaza los originales seleccionados por su versión comprimida."""
+    applied, saved, errors = 0, 0, []
+    by_dest = {d["dest"]: k for k, d in proj["decisions"].items()}
+    optimized = proj.setdefault("optimized", {})
+    for src, r in run["results"].items():
+        if r["status"] != "ok" or src not in selected:
+            continue
+        srcp, tmp = Path(src), Path(r["tmp"])
+        try:
+            stt = srcp.stat()
+            if stt.st_size != r["orig_size"] or abs(stt.st_mtime - r["orig_mtime"]) > 1:
+                raise RuntimeError("el original cambió después de comprimir; no se reemplaza")
+            if not tmp.is_file():
+                raise RuntimeError("falta el archivo comprimido")
+            if r["new_ext"] == srcp.suffix.lower():
+                target = srcp
+                os.replace(tmp, target)  # atómico: mismo sistema de archivos
+            else:  # p. ej. PNG -> WebP o AVI -> MP4
+                target = unique_path(srcp.with_suffix(r["new_ext"]))
+                shutil.move(str(tmp), str(target))
+                srcp.unlink()
+                if src in by_dest:
+                    proj["decisions"][by_dest[src]]["dest"] = str(target)
+            os.utime(target, (stt.st_atime, stt.st_mtime))  # conserva la fecha de modificación
+            optimized.pop(src, None)
+            optimized[str(target)] = target.stat().st_size
+            applied += 1
+            saved += r["orig_size"] - r["new_size"]
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{srcp.name}: {e}")
+    proj.setdefault("optimization_log", []).append(
+        {"at": datetime.now().isoformat(timespec="seconds"), "files": applied, "saved_bytes": saved}
+    )
+    save_project(proj)
+    discard_opt_run(proj)
+    return applied, saved, errors
+
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def cached_frame(path: str, mtime: float, seconds: float) -> bytes | None:
+    return comp.extract_frame(Path(path), seconds)
+
+
+def _cmp_images(before: bytes, after: bytes, zoom: bool) -> tuple[str, str, tuple[int, int]] | None:
+    """Prepara ambas imágenes con el mismo encuadre y las devuelve en base64 (PNG)."""
+    try:
+        a = ImageOps.exif_transpose(Image.open(BytesIO(before))).convert("RGB")
+        b = ImageOps.exif_transpose(Image.open(BytesIO(after))).convert("RGB")
+    except Exception:
+        return None
+    if b.size != a.size:
+        b = b.resize(a.size)
+    if zoom:  # recorte central al 100 %: los artefactos se ven sin el suavizado del escalado
+        w, h = min(CMP_MAX[0], a.width), min(CMP_MAX[1], a.height)
+        box = ((a.width - w) // 2, (a.height - h) // 2, (a.width - w) // 2 + w, (a.height - h) // 2 + h)
+        a, b = a.crop(box), b.crop(box)
+    else:
+        a.thumbnail(CMP_MAX)
+        b = b.resize(a.size)
+    enc = []
+    for img in (a, b):
+        buf = BytesIO()
+        img.save(buf, "PNG")
+        enc.append(base64.b64encode(buf.getvalue()).decode())
+    return enc[0], enc[1], a.size
+
+
+def compare_slider(before: bytes | None, after: bytes | None, zoom: bool) -> None:
+    prepared = _cmp_images(before, after, zoom) if before and after else None
+    if not prepared:
+        st.warning("No se pudo generar la vista previa de este archivo.")
+        return
+    b64_before, b64_after, (w, h) = prepared
+    html = f"""
+<style>
+ body{{margin:0}}
+ .cmp{{position:relative;max-width:{w}px;margin:auto;user-select:none;font-family:sans-serif}}
+ .cmp img{{display:block;width:100%;height:auto}}
+ .cmp .before{{position:absolute;inset:0;clip-path:inset(0 50% 0 0)}}
+ .cmp .line{{position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;
+             box-shadow:0 0 4px #000;pointer-events:none}}
+ .cmp input{{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:ew-resize;margin:0}}
+ .tag{{position:absolute;top:8px;padding:2px 8px;background:rgba(0,0,0,.6);color:#fff;
+       border-radius:4px;font-size:13px;pointer-events:none}}
+</style>
+<div class="cmp">
+ <img src="data:image/png;base64,{b64_after}">
+ <img class="before" id="b" src="data:image/png;base64,{b64_before}">
+ <div class="line" id="l"></div>
+ <span class="tag" style="left:8px">◀ Antes (original)</span>
+ <span class="tag" style="right:8px">Después (comprimido) ▶</span>
+ <input type="range" min="0" max="100" value="50" step="0.1" aria-label="Comparar"
+  oninput="document.getElementById('b').style.clipPath='inset(0 '+(100-this.value)+'% 0 0)';
+           document.getElementById('l').style.left=this.value+'%'">
+</div>"""
+    components.html(html, height=h + 8)
+    st.caption("Arrastra sobre la imagen para mover la cortina entre el original y el comprimido.")
+
+
+def tools_panel() -> None:
+    t = comp.TOOLS
+    ok = lambda name: "✅" if t[name] else "❌"  # noqa: E731
+    with st.expander("🧰 Herramientas detectadas en el sistema", expanded=not t["ffmpeg"] or not t["jpegoptim"]):
+        st.markdown(
+            f"- {ok('jpegoptim')} **jpegoptim** (JPEG) · respaldo {ok('jpegtran')} jpegtran\n"
+            f"- {ok('oxipng')} **oxipng** (PNG) · respaldo {ok('optipng')} optipng · si no hay ninguno, Pillow\n"
+            f"- ✅ **Pillow** (WebP sin pérdida)\n"
+            f"- {ok('ffmpeg')} **ffmpeg** / {ok('ffprobe')} ffprobe (vídeos)\n"
+            f"- {ok('exiftool')} **exiftool** (refuerza fecha/GPS de los vídeos)"
+        )
+        st.code("sudo apt install ffmpeg jpegoptim optipng libjpeg-turbo-progs libimage-exiftool-perl\n"
+                "sudo apt install oxipng   # opcional: Debian 13 / Ubuntu 24.10 o posteriores", language="bash")
+
+
+def optimization_view(proj: dict) -> None:
+    st.subheader("3️⃣ Optimización y compresión (opcional)")
+    st.caption(
+        "Paso final e independiente. **Nada se modifica hasta que pulses «Confirmar y aplicar "
+        "compresión»**: primero se procesa todo en una carpeta temporal para que compares el antes y "
+        "el después. Si un archivo no reduce su peso, se conserva el original."
+    )
+    tools_panel()
+    run = load_opt_run(proj)
+    if run is None:
+        opt_config(proj)
+    else:
+        opt_results(proj, run)
+
+
+def opt_config(proj: dict) -> None:
+    log = proj.get("optimization_log", [])
+    if log:
+        st.success(
+            f"Optimizaciones ya aplicadas: {sum(x['files'] for x in log)} archivos · "
+            f"{fmt_size(sum(x['saved_bytes'] for x in log))} liberados en total."
+        )
+    if proj.get("optimization_skipped"):
+        st.info("Marcaste este paso como omitido: tus archivos están intactos. Puedes ejecutarlo cuando quieras.")
+
+    all_cats = proj["categories"] + [DISCARD_DIR]
+    label = lambda c: "🗑️ _Descartadas" if c == DISCARD_DIR else c  # noqa: E731
+    scope = st.radio("Alcance", ["todo", "categorias"], horizontal=True, key="opt_scope",
+                     format_func=lambda v: "Todo el proyecto" if v == "todo" else "Solo categorías específicas")
+    if scope == "todo":
+        cats = all_cats
+    else:
+        cats = st.multiselect("Categorías a comprimir", all_cats, default=proj["categories"][:1],
+                              format_func=label, key="opt_cats")
+    k1, k2, k3 = st.columns(3)
+    do_photos = k1.checkbox("📷 Fotos", value=True, key="opt_photos")
+    do_videos = k2.checkbox("🎬 Vídeos", value=True, key="opt_videos")
+    reprocess = k3.checkbox("Reprocesar archivos ya optimizados", value=False, key="opt_re")
+
+    col_f, col_v = st.columns(2)
+    with col_f.container(border=True):
+        st.markdown("**📷 Fotos**")
+        jpeg_mode = st.radio(
+            "JPEG", ["lossless", "visual"], key="opt_jpeg_mode",
+            format_func=lambda m: "Sin pérdida: optimiza la codificación, píxeles idénticos"
+            if m == "lossless" else "Visualmente sin pérdida: limita la calidad máxima",
+        )
+        jpeg_q = st.slider("Calidad máxima JPEG", 85, 98, 92, key="opt_jpeg_q",
+                           disabled=jpeg_mode == "lossless",
+                           help="Solo recomprime las fotos guardadas con más calidad que este valor.")
+        strip = st.checkbox("Eliminar metadatos redundantes (comentarios, XMP, IPTC)", value=True,
+                            key="opt_strip", help="El EXIF con fecha, GPS y orientación se conserva siempre.")
+        webp = st.checkbox("Convertir PNG/BMP/TIFF a WebP sin pérdida (si pesa menos)", value=False,
+                           key="opt_webp", help="Píxeles idénticos, pero la extensión cambia a .webp.")
+    with col_v.container(border=True):
+        st.markdown("**🎬 Vídeos**")
+        codec = st.selectbox(
+            "Códec", ["libx265", "libx264"], key="opt_codec",
+            format_func=lambda c: "H.265 / HEVC (más compresión)" if c == "libx265"
+            else "H.264 / AVC (máxima compatibilidad)",
+        )
+        crf = st.slider("CRF (menor = más calidad)", 14, 30, 22 if codec == "libx265" else 18,
+                        key=f"opt_crf_{codec}", help="Visualmente indistinguible: ~18 en H.264 y ~22 en H.265.")
+        preset = st.select_slider("Preset", ["fast", "medium", "slow"], value="medium", key="opt_preset",
+                                  help="Más lento = archivos algo más pequeños con la misma calidad.")
+        skip_hevc = st.checkbox("Omitir vídeos que ya están en HEVC/AV1/VP9", value=True, key="opt_skiphevc")
+        st.caption("Se conservan la pista de audio, la rotación, la fecha y el GPS. Los vídeos HDR se dejan intactos.")
+
+    kinds = ({"foto"} if do_photos else set()) | ({"video"} if do_videos else set())
+    files = files_in_scope(proj, set(cats), kinds, reprocess)
+    n_vid = sum(f["kind"] == "video" for f in files)
+    st.markdown(
+        f"**{len(files)} archivos** en el alcance ({len(files) - n_vid} fotos, {n_vid} vídeos) · "
+        f"{fmt_size(sum(f['size'] for f in files))}"
+    )
+    if n_vid:
+        st.caption("⏳ Recomprimir vídeo lleva tiempo (de segundos a varios minutos por archivo).")
+
+    b1, b2 = st.columns([2, 1])
+    if b1.button("🚀 Comprimir en carpeta temporal (vista previa)", type="primary",
+                 disabled=not files, width="stretch"):
+        opts = comp.Options(
+            jpeg_mode=jpeg_mode, jpeg_quality=jpeg_q, strip_redundant=strip, png_to_webp=webp,
+            video_codec=codec, video_crf=crf, video_preset=preset, skip_hevc=skip_hevc,
+        )
+        run = {
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "options": opts.to_dict(),
+            "queue": [f["path"] for f in files],
+            "categories": {f["path"]: f["category"] for f in files},
+            "results": {},
+        }
+        save_opt_run(proj, run)
+        process_opt_run(proj, run)
+        st.rerun()
+    if b2.button("⏭️ Omitir este paso (no tocar nada)", width="stretch"):
+        proj["optimization_skipped"] = True
+        save_project(proj)
+        ss.flash = ("success", "Optimización omitida: tus archivos quedan intactos.")
+        st.rerun()
+
+
+def opt_results(proj: dict, run: dict) -> None:
+    pending = [p for p in run["queue"] if p not in run["results"]]
+    if pending:
+        st.warning(f"La compresión se interrumpió: faltan {len(pending)} de {len(run['queue'])} archivos.")
+        if st.button("▶️ Continuar compresión", type="primary"):
+            process_opt_run(proj, run)
+            st.rerun()
+
+    results = list(run["results"].values())
+    ok = [r for r in results if r["status"] == "ok"]
+    orig_total = sum(r["orig_size"] for r in results)
+    final_total = sum(r["new_size"] if r["status"] == "ok" else r["orig_size"] for r in results)
+    saved_total = orig_total - final_total
+    pct = saved_total / orig_total * 100 if orig_total else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("💾 Espacio total inicial", fmt_size(orig_total))
+    m2.metric("📦 Espacio final", fmt_size(final_total), delta=f"-{pct:.1f} %", delta_color="inverse")
+    m3.metric("🎉 Espacio total liberado", fmt_size(saved_total))
+    m4.metric("Archivos reducidos", f"{len(ok)} / {len(results)}")
+
+    st.markdown("#### 📋 Antes y después, archivo por archivo")
+    srcs = list(run["results"])
+    rows = []
+    for src in srcs:
+        r = run["results"][src]
+        name = Path(src).name
+        if r["status"] == "ok" and r["new_ext"] != Path(src).suffix.lower():
+            name += f" → {r['new_ext']}"
+        rows.append({
+            "Aplicar": r["status"] == "ok",
+            "Archivo": name,
+            "Categoría": run["categories"].get(src, ""),
+            "Tipo": "🎬" if r["kind"] == "video" else "📷",
+            "Original (MB)": r["orig_size"] / MB,
+            "Comprimido (MB)": (r["new_size"] if r["status"] == "ok" else r["orig_size"]) / MB,
+            "Ahorro (%)": (1 - r["new_size"] / r["orig_size"]) * 100 if r["status"] == "ok" else 0.0,
+            "Estado": STATUS_LABELS.get(r["status"], r["status"]),
+            "Detalle": r["tool"] if r["status"] == "ok" else (r["msg"] or r["tool"]),
+        })
+    if not rows:
+        rows_df = pd.DataFrame(columns=["Aplicar"])
+    edited = rows_df if not rows else st.data_editor(
+        pd.DataFrame(rows), hide_index=True, width="stretch", key="opt_table",
+        disabled=[c for c in rows[0] if c != "Aplicar"] if rows else True,
+        column_config={
+            "Aplicar": st.column_config.CheckboxColumn(help="Desmarca para conservar el original"),
+            "Original (MB)": st.column_config.NumberColumn(format="%.2f"),
+            "Comprimido (MB)": st.column_config.NumberColumn(format="%.2f"),
+            "Ahorro (%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f %%"),
+        },
+    )
+    selected = {src for src, keep in zip(srcs, edited["Aplicar"]) if keep and run["results"][src]["status"] == "ok"}
+
+    if ok:
+        st.markdown("#### 🔍 Comparador antes / después")
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        sel = c1.selectbox("Archivo", [r["src"] for r in ok], key="opt_cmp",
+                           format_func=lambda s: f"{Path(s).name}  (−{(1 - run['results'][s]['new_size'] / run['results'][s]['orig_size']) * 100:.1f} %)")
+        zoom = c2.toggle("🔎 Zoom 100 %", key="opt_zoom", help="Recorte central sin escalar para ver detalles finos")
+        r = run["results"][sel]
+        src_p, tmp_p = Path(sel), Path(r["tmp"])
+        if not (src_p.is_file() and tmp_p.is_file()):
+            st.warning("Falta el original o el archivo comprimido.")
+        elif r["kind"] == "video":
+            dur = comp.video_duration(src_p)
+            t = st.slider("Fotograma a comparar (segundos)", 0.0, max(dur - 0.1, 0.1),
+                          min(1.0, dur / 2), 0.1, key=f"opt_t_{_wkey(sel)}") if dur > 0.2 else 0.0
+            compare_slider(cached_frame(str(src_p), src_p.stat().st_mtime, t),
+                           cached_frame(str(tmp_p), tmp_p.stat().st_mtime, t), zoom)
+            with st.expander("▶️ Reproducir ambos vídeos"):
+                v1, v2 = st.columns(2)
+                v1.caption(f"Original · {fmt_size(r['orig_size'])}")
+                v1.video(str(src_p))
+                v2.caption(f"Comprimido · {fmt_size(r['new_size'])} (si no se reproduce, el navegador no admite HEVC)")
+                v2.video(str(tmp_p))
+        else:
+            compare_slider(src_p.read_bytes(), tmp_p.read_bytes(), zoom)
+
+    saved_sel = sum(run["results"][s]["orig_size"] - run["results"][s]["new_size"] for s in selected)
+    b1, b2 = st.columns([2, 1])
+    if b1.button(f"✅ Confirmar y aplicar compresión ({len(selected)} archivos · libera {fmt_size(saved_sel)})",
+                 type="primary", disabled=not selected, width="stretch"):
+        with st.spinner("Reemplazando archivos…"):
+            applied, saved, errors = apply_opt_run(proj, run, selected)
+        msg = f"Compresión aplicada a {applied} archivos: {fmt_size(saved)} liberados."
+        ss.flash = ("warning", msg + " Errores: " + "; ".join(errors)) if errors else ("success", msg)
+        st.rerun()
+    if b2.button("🗑️ Descartar resultados (dejar todo intacto)", width="stretch"):
+        discard_opt_run(proj)
+        ss.flash = ("info", "Resultados descartados: no se modificó ningún archivo.")
+        st.rerun()
 
 
 def stats_header(proj: dict, items: list[dict]) -> None:
@@ -951,14 +1372,23 @@ def stats_header(proj: dict, items: list[dict]) -> None:
         col.metric(("🗑️ Descartadas" if cat == DISCARD_DIR else f"📁 {cat}"), n)
 
 
+VIEW_LABELS = {"similares": "1️⃣ Similares", "revision": "2️⃣ Revisión", "optimizacion": "3️⃣ Optimizar"}
+
+
+def go_to(view: str) -> None:
+    ss["_goto_view"] = view
+    st.rerun()
+
+
 def project_screen() -> None:
     proj = ss.project
     sidebar_project(proj)
+    if "_goto_view" in ss:  # cambio de paso pedido por un botón (antes de crear el widget)
+        ss.view = ss.pop("_goto_view")
     view = st.sidebar.segmented_control(
-        "Vista", ["revision", "similares"], default="revision", key="view", required=True,
-        format_func=lambda v: "🖼️ Revisión" if v == "revision" else "🧬 Similares",
-        width="stretch",
-    ) or "revision"
+        "Flujo de trabajo", list(VIEW_LABELS), default="similares", key="view", required=True,
+        format_func=VIEW_LABELS.get, width="stretch",
+    ) or "similares"
 
     if ss.flash:
         kind, msg = ss.flash
@@ -982,6 +1412,8 @@ def project_screen() -> None:
 
     if view == "similares":
         similar_view(proj, items)
+    elif view == "optimizacion":
+        optimization_view(proj)
     else:
         review_view(proj, items)
 
@@ -1056,7 +1488,7 @@ def review_view(proj: dict, items: list[dict]) -> None:
         if np_ is not None:
             ss.idx = np_
         else:
-            ss.flash = ("success", "🎉 ¡Todas las fotos están revisadas!")
+            ss.flash = ("success", "🎉 ¡Todo revisado! Si quieres, pasa al paso 3️⃣ Optimizar (opcional).")
         st.rerun()
 
     cats = proj["categories"]

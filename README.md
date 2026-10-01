@@ -7,7 +7,7 @@ mapa de geolocalización, atajos de teclado y detección de fotos duplicadas o e
 ```
 📁 Fotos_Organizadas/               ← carpeta de destino base
 └── 📁 Vacaciones_2025/             ← un proyecto
-    ├── 📁 Playa/
+    ├── 📁 Playa/                   ← VAC_PLA_20250714_153022.jpg …
     ├── 📁 Familia/
     ├── 📁 Salidas_Comida/
     ├── 📁 _Descartadas/            ← nunca se borra nada del disco
@@ -20,6 +20,9 @@ Requisitos: Python 3.10+ con `venv`, y `exiftool` para leer la fecha y el GPS de
 
 ```bash
 sudo apt install python3 python3-venv libimage-exiftool-perl
+# Para el paso opcional de optimización:
+sudo apt install ffmpeg jpegoptim optipng libjpeg-turbo-progs
+sudo apt install oxipng   # opcional, solo en Debian 13 / Ubuntu 24.10 o posteriores
 ```
 
 Sin exiftool la app funciona igual, pero los vídeos aparecen sin fecha ni ubicación
@@ -37,14 +40,32 @@ Ciérrala con `Ctrl+C` en la terminal.
 
 ## Uso
 
-1. **Nuevo proyecto**: nombre, carpeta de origen, categorías iniciales,
-   copiar o mover y, si quieres, un rango de fechas (EXIF `DateTimeOriginal`).
-   **Continuar proyecto**: elige uno de los existentes en la carpeta de destino.
-2. **Revisión**: cada foto se muestra en grande; en la barra lateral ves la fecha
-   de captura, el nombre original, la resolución, el tamaño, la cámara y un mapa
-   OpenStreetMap si la foto tiene GPS.
-3. Clasifica con los botones o el teclado. El progreso se guarda tras cada foto.
-   Puedes añadir categorías en cualquier momento desde la barra lateral.
+Crea un **nuevo proyecto** (nombre, carpeta de origen, categorías iniciales, copiar
+o mover y, opcionalmente, un rango de fechas) o **continúa** uno existente. El trabajo
+sigue tres pasos, que eliges en la barra lateral («Flujo de trabajo»):
+
+1. **1️⃣ Similares**: primero eliminas clones y ráfagas. Las fotos que conservas
+   siguen pendientes; las demás van a `_Descartadas/`. Pulsa «Terminar y pasar a
+   revisión» cuando acabes.
+2. **2️⃣ Revisión**: cada foto o vídeo se muestra en grande, con fecha de captura,
+   nombre, resolución, tamaño, cámara y mapa OpenStreetMap si tiene GPS. Clasifica
+   con los botones o el teclado; el progreso se guarda tras cada archivo.
+3. **3️⃣ Optimizar** (opcional): compresión sin pérdida de calidad de lo ya organizado.
+
+### Renombrado automático
+
+Al clasificar, cada archivo se renombra como `[PRO]_[CAT]_[FECHA].ext`:
+
+- `PRO` / `CAT`: tres primeras letras del proyecto y de la categoría, en mayúsculas
+  (`DSC` para las descartadas).
+- `FECHA`: captura EXIF/QuickTime en formato `YYYYMMDD_HHMMSS`; si no hay, la fecha de
+  modificación del archivo; y si tampoco, `SINFECHA_YYYYMMDD` (hoy).
+- Si ya existe un archivo con el mismo nombre (mismo segundo), se añade `_001`, `_002`…
+- La extensión se pasa a minúsculas.
+
+Ejemplo: `IMG_4021.JPG` → `Vacaciones_2025/Playa/VAC_PLA_20250714_153022.jpg`.
+Al reclasificar se renombra con la nueva categoría; al deshacer (modo mover) vuelve
+a su nombre y ruta originales.
 
 ### Vídeos
 
@@ -56,9 +77,7 @@ Si el navegador no puede reproducir el formato (AVI, algunos MKV, HEVC/H.265),
 usa el botón **Abrir en reproductor**, que abre el archivo con el reproductor del sistema.
 Los vídeos de más de 500 MB piden confirmación antes de cargarse en el navegador.
 
-### Limpieza de similares
-
-En la barra lateral, **Vista → 🧬 Similares**:
+### 1️⃣ Limpieza de similares
 
 - Calcula un *hash perceptual* (`phash` o `dhash`) de cada foto pendiente
   (opcionalmente también de las ya clasificadas).
@@ -66,9 +85,34 @@ En la barra lateral, **Vista → 🧬 Similares**:
   ráfagas (4–6) o fotos simplemente parecidas (8–10).
 - Muestra cada grupo lado a lado con resolución, tamaño y fecha, y marca la de
   mejor calidad (mayor resolución y tamaño).
-- **Conservar N en «Categoría» y descartar el resto** aplica las casillas marcadas;
-  **⭐ Solo esta** resuelve el grupo con un clic. Las demás van a `_Descartadas/`.
+- **Conservar N y descartar el resto** aplica las casillas marcadas; **⭐ Solo esta**
+  resuelve el grupo con un clic. Las descartadas van a `_Descartadas/` y las conservadas
+  quedan pendientes para clasificarlas en la revisión.
 - **No son duplicadas** oculta ese grupo para siempre (se guarda en el JSON del proyecto).
+
+### 3️⃣ Optimización y compresión (opcional)
+
+Paso final e independiente: no se toca nada salvo que tú lo confirmes. Puedes pulsar
+**«Omitir este paso»** y dejar los archivos tal cual.
+
+- **Alcance**: todo el proyecto o solo las categorías que elijas; fotos, vídeos o ambos.
+- **JPEG**: *sin pérdida* (jpegoptim/jpegtran reoptimizan la codificación; los píxeles
+  quedan idénticos) o *visualmente sin pérdida* (`jpegoptim -m92`: solo recomprime las
+  fotos guardadas con más calidad). Opcionalmente quita metadatos redundantes
+  (comentarios, XMP, IPTC); el EXIF con fecha, GPS y orientación se conserva siempre.
+- **PNG**: oxipng → optipng → Pillow (todos sin pérdida). Opción de convertir
+  PNG/BMP/TIFF a **WebP sin pérdida** si pesa menos.
+- **Vídeo**: ffmpeg con H.265 (CRF 22) o H.264 (CRF 18), preset ajustable. Conserva
+  la pista de audio (la copia; si no se puede, AAC 192k), la rotación, la fecha y el GPS.
+  Omite los vídeos HDR y, opcionalmente, los que ya están en HEVC/AV1/VP9.
+- **Seguridad**: todo se procesa primero en `[Proyecto]/.optimizacion_tmp/`. Ves una
+  tabla con el antes y el después de cada archivo (tamaño y % de ahorro), el espacio
+  total inicial, final y liberado, y un **comparador con cortina deslizante** (con zoom
+  al 100 % y selección de fotograma en vídeos). Solo al pulsar **«Confirmar y aplicar
+  compresión»** se reemplazan los originales (puedes desmarcar archivos); los que no
+  reducen peso se conservan siempre. «Descartar resultados» borra la carpeta temporal.
+- Si se interrumpe (por ejemplo, al cerrar la pestaña), el progreso queda guardado y
+  puedes **continuar** después.
 
 ### Atajos de teclado
 
