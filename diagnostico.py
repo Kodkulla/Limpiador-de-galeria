@@ -7,6 +7,7 @@ y genera un inventario CSV. Por defecto SOLO LEE: no mueve, no renombra y no bor
 Uso:
     python3 diagnostico.py                 # busca en tu carpeta personal y discos externos
     python3 diagnostico.py /ruta/extra     # además, busca en otras carpetas
+    python3 diagnostico.py --todo          # busca en TODO el sistema (más lento)
     python3 diagnostico.py --reparar       # vuelve a COPIAR al destino los archivos que falten
                                            # y cuyo original siga existiendo (nunca sobrescribe)
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import sys
 from collections import Counter
@@ -27,6 +29,10 @@ STATE_FILE = "proyecto_estado.json"
 CONFIG = Path.home() / ".config" / "limpiador-galeria" / "config.json"
 MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".gif", ".heic", ".heif",
               ".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".webm"}
+# Nombres que pone la app al clasificar: VAC_PLA_20250714_153022.jpg, VAC_DSC_SINFECHA_20261001_001.jpg…
+RENAMED = re.compile(r"^[A-Z0-9]{1,3}_[A-Z0-9]{1,3}_(\d{8}_\d{6}|SINFECHA_\d{8})(_\d{3})?\.[a-z0-9]+$")
+SYSTEM_DIRS = {"/proc", "/sys", "/dev", "/run/user", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+               "/etc", "/boot", "/var/lib", "/var/cache", "/snap", "/tmp/.X11-unix"}
 SKIP_DIRS = {".cache", ".local", ".var", ".mozilla", ".git", ".venv", "node_modules", "__pycache__"}
 
 
@@ -36,16 +42,27 @@ def resolve(p: str | Path) -> Path:
     return p if p.is_absolute() else (APP_DIR / p)
 
 
-def find_projects(roots: list[Path]) -> list[Path]:
-    found = set()
+def find_projects(roots: list[Path]) -> tuple[list[Path], Counter]:
+    """Devuelve las carpetas con proyecto_estado.json y, de paso, cuántos archivos
+    renombrados por la app hay en cada carpeta (por si el registro no aparece)."""
+    found, renamed = set(), Counter()
+    seen = set()
     for root in roots:
         if not root.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+            real = os.path.realpath(dirpath)
+            if real in seen or any(real == d or real.startswith(d + "/") for d in SYSTEM_DIRS):
+                dirnames[:] = []
+                continue
+            seen.add(real)
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             if STATE_FILE in filenames:
-                found.add(Path(dirpath).resolve())
-    return sorted(found)
+                found.add(Path(real))
+            n = sum(1 for f in filenames if RENAMED.match(f))
+            if n:
+                renamed[real] = n
+    return sorted(found), renamed
 
 
 def scan_pending(source: Path, decided: set[str], exclude: Path, recursive: bool) -> int:
@@ -85,10 +102,15 @@ def check_project(pdir: Path, repair: bool) -> None:
     source = resolve(proj.get("source", ""))
     cats = Counter(d.get("category", "?") for d in decisions.values())
 
-    rows, ok, missing_recoverable, lost = [], 0, [], []
+    rows, ok, missing_recoverable, lost, known = [], 0, [], [], set()
     for original, d in decisions.items():
         dest = resolve(d.get("dest", ""))
+        if not dest.is_file():  # ¿se movió la carpeta del proyecto? buscar dentro de la actual
+            moved = pdir / dest.parent.name / dest.name
+            if moved.is_file():
+                dest = moved
         orig_p = Path(original)
+        known.add(str(dest))
         dest_ok = dest.is_file()
         orig_ok = orig_p.is_file()
         if dest_ok:
@@ -108,7 +130,6 @@ def check_project(pdir: Path, repair: bool) -> None:
         })
 
     # Archivos dentro del proyecto que el JSON no menciona
-    known = {str(resolve(d.get("dest", ""))) for d in decisions.values()}
     orphans = [p for p in pdir.rglob("*")
                if p.is_file() and p.suffix.lower() in MEDIA_EXTS and str(p) not in known
                and ".optimizacion_tmp" not in p.parts]
@@ -172,18 +193,30 @@ def main() -> None:
         cfg = {}
         print("   (No hay configuración guardada de la app.)")
 
-    roots = [Path.home(), APP_DIR, Path("/media"), Path("/mnt"), Path("/run/media")]
+    roots = [Path("/")] if "--todo" in sys.argv else \
+        [Path.home(), APP_DIR, Path("/media"), Path("/mnt"), Path("/run/media")]
     roots += [Path(a).expanduser() for a in args]
     if cfg.get("last_base"):
         roots.append(resolve(cfg["last_base"]))
     print("   Buscando proyectos (puede tardar un poco)…")
-    projects = find_projects(roots)
-    if not projects:
-        print("\n❌ No se encontró ningún proyecto (proyecto_estado.json)."
-              "\n   Si guardaste en otro disco, pásalo como argumento: python3 diagnostico.py /ruta/al/disco")
-        return
+    projects, renamed = find_projects(roots)
     for pdir in projects:
         check_project(pdir, repair)
+
+    # Carpetas con archivos ya renombrados por la app que no pertenecen a ningún proyecto encontrado
+    loose = {d: n for d, n in renamed.items()
+             if not any(d == str(p) or d.startswith(str(p) + "/") for p in projects)}
+    if loose:
+        print(f"\n{'=' * 70}\n🔎 Carpetas con fotos/vídeos renombrados por la app (VAC_PLA_…):")
+        for d, n in sorted(loose.items(), key=lambda x: -x[1]):
+            print(f"   {n:6d} archivos  →  {d}")
+    if not projects and not loose:
+        print("\n❌ No se encontró ningún proyecto ni archivos renombrados por la app."
+              "\n   Prueba a buscar en todo el sistema:   python3 diagnostico.py --todo"
+              "\n   o en un disco concreto:              python3 diagnostico.py /ruta/al/disco"
+              "\n   Si no aparece nada, lo más probable es que las fotos sigan sin tocar en su"
+              "\n   carpeta de origen (por ejemplo, si solo usaste el paso «Similares»).")
+        return
     print(f"\n{'=' * 70}\nNo se ha borrado ni movido nada. Puedes abrir las carpetas indicadas arriba.")
 
 

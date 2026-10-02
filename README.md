@@ -81,6 +81,9 @@ y si falta alguna. Además guarda un inventario CSV y una copia de seguridad del
 en la carpeta del proyecto. **No mueve ni borra nada.**
 
 - `python3 diagnostico.py /ruta/al/disco`: busca también en otra carpeta.
+- `python3 diagnostico.py --todo`: busca en todo el sistema. Además de los proyectos,
+  lista las carpetas con archivos ya renombrados por la app (`VAC_PLA_…`), aunque no
+  tengan registro.
 - `python3 diagnostico.py --reparar`: si a una foto clasificada le falta su copia en el
   proyecto pero el original sigue en el origen, la vuelve a copiar (nunca sobrescribe).
 
