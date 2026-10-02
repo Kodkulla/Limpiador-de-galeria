@@ -68,6 +68,26 @@ Sin exiftool la app funciona igual, pero los vídeos aparecen sin fecha ni ubica
 (y quedan fuera si filtras por fechas sin incluir los «sin fecha»). Sin las
 herramientas de compresión, solo deja de estar disponible el paso opcional 3️⃣.
 
+## ¿No encuentras tus fotos? Diagnóstico
+
+```bash
+python3 diagnostico.py
+```
+
+Busca todos tus proyectos (en tu carpeta personal, la carpeta de la app y los discos
+externos de `/run/media`), y por cada uno te dice **en qué carpeta exacta** están las
+fotos clasificadas, cuántas hay por categoría, cuántas siguen sin clasificar en el origen
+y si falta alguna. Además guarda un inventario CSV y una copia de seguridad del registro
+en la carpeta del proyecto. **No mueve ni borra nada.**
+
+- `python3 diagnostico.py /ruta/al/disco`: busca también en otra carpeta.
+- `python3 diagnostico.py --reparar`: si a una foto clasificada le falta su copia en el
+  proyecto pero el original sigue en el origen, la vuelve a copiar (nunca sobrescribe).
+
+Nota: en versiones anteriores, si la carpeta de destino se escribía como ruta relativa
+(sin `/` ni `~`), los proyectos se guardaban dentro de la carpeta de la app. Ahora la app
+muestra siempre la ruta completa y el botón **📂 Abrir carpeta del proyecto**.
+
 ## Uso
 
 Crea un **nuevo proyecto** (nombre, carpeta de origen, categorías iniciales, copiar

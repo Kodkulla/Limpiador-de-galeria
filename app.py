@@ -575,7 +575,15 @@ def setup_screen() -> None:
         value=gcfg.get("last_base", DEFAULT_BASE),
         help="Aquí se creará una carpeta por cada proyecto.",
     )
-    base = str(Path(base).expanduser())
+    base_path = Path(base.strip() or DEFAULT_BASE).expanduser()
+    if not base_path.is_absolute():
+        # Antes una ruta relativa se tomaba respecto a la carpeta de la app sin avisar:
+        # se mantiene esa ubicación (para no perder proyectos ya creados) pero se muestra.
+        base_path = Path.cwd() / base_path
+        st.warning(f"Escribiste una ruta relativa; se usará la ruta completa:\n\n`{base_path.resolve()}`\n\n"
+                   f"Para guardar en tu carpeta personal escribe, por ejemplo, `~/Fotos_Organizadas`.")
+    base = str(base_path.resolve())
+    st.caption(f"📍 Los proyectos se guardarán en: `{base}`")
     existing = list_projects(base)
 
     tab_new, tab_open = st.tabs(["➕ Nuevo proyecto", f"📂 Continuar proyecto ({len(existing)})"])
@@ -670,7 +678,10 @@ def sidebar_project(proj: dict) -> None:
     sb.markdown(f"### 📁 {proj['name']}")
     home = str(Path.home())
     short = lambda p: str(p).replace(home, "~", 1)  # noqa: E731
-    sb.caption(f"Destino: `{short(project_dir(proj))}`\n\nOrigen: `{short(proj['source'])}`")
+    sb.caption(f"Destino (aquí se guardan las fotos clasificadas):\n\n`{project_dir(proj).resolve()}`"
+               f"\n\nOrigen: `{short(proj['source'])}`")
+    if sb.button("📂 Abrir carpeta del proyecto", width="stretch"):
+        open_with_system(str(project_dir(proj).resolve()))
 
     with sb.form("add_cat", clear_on_submit=True, border=False):
         c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
@@ -966,7 +977,7 @@ def similar_view(proj: dict, items: list[dict]) -> None:
                         if st.button("⭐ Solo esta", key=f"only_{gid}_{_wkey(m['key'])}", width="stretch",
                                      help="Conservar esta y descartar las demás del grupo"):
                             errs = apply_group(proj, group, {m["key"]})
-                            ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto")
+                            ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto: las conservadas siguen pendientes hasta clasificarlas en Revisión")
                             st.rerun()
             b1, b2 = st.columns([3, 1])
             n_disc = len(group) - len(keep)
@@ -975,7 +986,7 @@ def similar_view(proj: dict, items: list[dict]) -> None:
                 key=f"apply_{gid}", type="primary", width="stretch", disabled=not keep or not n_disc,
             ):
                 errs = apply_group(proj, group, keep)
-                ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto")
+                ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto: las conservadas siguen pendientes hasta clasificarlas en Revisión")
                 st.rerun()
             if b2.button("🙈 No son duplicadas", key=f"ign_{gid}", width="stretch",
                          help="Ocultar este grupo en el futuro"):
