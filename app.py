@@ -9,6 +9,7 @@ Estructura de salida:
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import hashlib
 import json
 import os
@@ -21,8 +22,6 @@ from io import BytesIO
 from pathlib import Path
 
 import folium
-import imagehash
-import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -30,6 +29,8 @@ from PIL import Image, ImageOps
 from streamlit_folium import st_folium
 
 import compresion as comp
+import similares as sim
+from selector_carpetas import folder_picker, quick_places
 
 # --------------------------------------------------------------------------
 # Constantes
@@ -42,7 +43,6 @@ CONFIG_PATH = Path.home() / ".config" / "limpiador-galeria" / "config.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".gif"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".webm"}
 DISPLAY_MAX = (1800, 820)  # tamaño máximo de la imagen en el visor
-THUMB_MAX = (480, 360)  # miniaturas de la vista de similares
 EXIFTOOL = shutil.which("exiftool")
 
 # Soporte opcional para fotos HEIC/HEIF de móviles (pip install pillow-heif)
@@ -230,23 +230,6 @@ def display_bytes(path: str, mtime: float) -> bytes | None:
                 img = img.convert("RGB")
             buf = BytesIO()
             img.save(buf, format="JPEG", quality=88)
-            return buf.getvalue()
-    except Exception:
-        return None
-
-
-@st.cache_data(show_spinner=False, max_entries=5000)
-def thumb_bytes(path: str, mtime: float) -> bytes | None:
-    """Miniatura orientada para la vista de similares."""
-    try:
-        with Image.open(path) as img:
-            img.draft("RGB", (THUMB_MAX[0] * 2, THUMB_MAX[1] * 2))
-            img = ImageOps.exif_transpose(img)
-            img.thumbnail(THUMB_MAX)
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-            buf = BytesIO()
-            img.save(buf, format="JPEG", quality=82)
             return buf.getvalue()
     except Exception:
         return None
@@ -511,6 +494,8 @@ def open_project(proj: dict) -> None:
     ss.scan = None
     ss.idx = 0
     ss.jump_to_pending = True
+    for k in ("sim_result", "sim_sel", "sim_zoom", "sim_idx"):  # resultados de otro proyecto
+        ss.pop(k, None)
     ss["_goto_view"] = "revision" if proj.get("similar_done") else "similares"
     ensure_category_dirs(proj)
     gcfg["last_base"] = proj["base_dest"]
@@ -566,60 +551,71 @@ def date_filter_inputs(prefix: str, proj: dict | None = None) -> tuple[str | Non
     return d_from.isoformat(), d_to.isoformat(), undated
 
 
+def _default_base() -> str:
+    base = Path(gcfg.get("last_base", DEFAULT_BASE)).expanduser()
+    if not base.is_absolute():  # configuraciones antiguas con ruta relativa
+        base = Path.cwd() / base
+    return str(base.resolve())
+
+
+def _default_source() -> str:
+    last = gcfg.get("last_source")
+    if last and Path(last).is_dir():
+        return last
+    pictures = next((p for name, p in quick_places() if name.startswith("🖼️")), Path.home())
+    return str(pictures)
+
+
 def setup_screen() -> None:
     st.title("📸 Limpiador de Galería")
-    st.caption("Organiza tus fotos en Proyectos y Subcategorías sin borrar nada del disco.")
+    st.caption("Organiza tus fotos y vídeos en proyectos y categorías, sin borrar nada del disco.")
 
-    base = st.text_input(
-        "📁 Carpeta de destino base",
-        value=gcfg.get("last_base", DEFAULT_BASE),
-        help="Aquí se creará una carpeta por cada proyecto.",
+    base = folder_picker(
+        "📁 Carpeta de destino (donde se guardan los proyectos)", "pick_base", _default_base(),
+        help="Dentro se crea una carpeta por proyecto, con una subcarpeta por categoría.",
+        allow_create=True,
     )
-    base_path = Path(base.strip() or DEFAULT_BASE).expanduser()
-    if not base_path.is_absolute():
-        # Antes una ruta relativa se tomaba respecto a la carpeta de la app sin avisar:
-        # se mantiene esa ubicación (para no perder proyectos ya creados) pero se muestra.
-        base_path = Path.cwd() / base_path
-        st.warning(f"Escribiste una ruta relativa; se usará la ruta completa:\n\n`{base_path.resolve()}`\n\n"
-                   f"Para guardar en tu carpeta personal escribe, por ejemplo, `~/Fotos_Organizadas`.")
-    base = str(base_path.resolve())
-    st.caption(f"📍 Los proyectos se guardarán en: `{base}`")
     existing = list_projects(base)
 
-    tab_new, tab_open = st.tabs(["➕ Nuevo proyecto", f"📂 Continuar proyecto ({len(existing)})"])
+    labels = ["➕ Nuevo proyecto", f"📂 Continuar proyecto ({len(existing)})"]
+    tabs = st.tabs(labels[::-1] if existing else labels)
+    tab_open, tab_new = (tabs[0], tabs[1]) if existing else (tabs[1], tabs[0])
 
     with tab_open:
         if not existing:
             st.info("No hay proyectos en esta carpeta de destino todavía.")
-        else:
-            last = gcfg.get("last_project")
-            sel = st.selectbox(
-                "Proyecto", existing, index=existing.index(last) if last in existing else 0
-            )
+        last = gcfg.get("last_project")
+        for name in sorted(existing, key=lambda n: (n != last, n.lower())):
             try:
-                preview = load_project(Path(base) / sel)
-                st.caption(
-                    f"Origen: `{preview.get('source')}` · Categorías: "
-                    f"{', '.join(preview['categories'])} · Clasificadas: {len(preview['decisions'])}"
-                )
+                preview = load_project(Path(base) / name)
             except (OSError, ValueError) as e:
-                preview = None
-                st.error(f"No se pudo leer el estado del proyecto: {e}")
-            if st.button("Abrir proyecto", type="primary", disabled=preview is None):
-                open_project(preview)
-                st.rerun()
+                st.error(f"No se pudo leer el proyecto «{name}»: {e}")
+                continue
+            with st.container(border=True):
+                c1, c2 = st.columns([5, 1], vertical_alignment="center")
+                cats = Counter(d["category"] for d in preview["decisions"].values())
+                c1.markdown(f"### 📁 {name}" + ("  ·  _último usado_" if name == last else ""))
+                c1.caption(
+                    f"Origen: `{preview.get('source')}`  \n"
+                    f"Clasificadas: **{len(preview['decisions'])}** · "
+                    + " · ".join(f"{('🗑️ ' if c == DISCARD_DIR else '')}{c}: {n}" for c, n in cats.items())
+                    + (f"  \nÚltima modificación: {preview['updated'].replace('T', ' ')}" if preview.get("updated") else "")
+                )
+                if c2.button("Abrir ▶", key=f"open_{name}", type="primary", width="stretch"):
+                    open_project(preview)
+                    st.rerun()
 
     with tab_new:
         name = st.text_input("Nombre del proyecto", placeholder="Vacaciones_2025")
-        source = st.text_input(
-            "Carpeta de origen (fotos sin clasificar)",
-            value=gcfg.get("last_source", str(Path.home() / "Imágenes")),
+        source = folder_picker(
+            "🖼️ Carpeta de origen (fotos sin clasificar)", "pick_source", _default_source(),
+            media_exts=tuple(MEDIA_EXTS),
         )
         recursive = st.checkbox("Incluir subcarpetas del origen", value=True)
         cats_txt = st.text_area(
             "Categorías iniciales (una por línea o separadas por comas)",
             value="\n".join(DEFAULT_CATEGORIES),
-            height=120,
+            height=110,
         )
         mode = st.radio(
             "¿Qué hacer con cada foto clasificada?",
@@ -629,9 +625,12 @@ def setup_screen() -> None:
         )
         d_from, d_to, undated = date_filter_inputs("new")
 
+        pname_preview = safe_name(name)
+        if pname_preview:
+            st.caption(f"📍 Las fotos clasificadas se guardarán en: `{Path(base) / pname_preview}`")
         if st.button("Crear proyecto", type="primary"):
-            pname = safe_name(name)
-            src = Path(source).expanduser()
+            pname = pname_preview
+            src = Path(source)
             cats = []
             for c in re.split(r"[,\n]", cats_txt):
                 c = safe_name(c)
@@ -644,6 +643,9 @@ def setup_screen() -> None:
                 errors.append("Ya existe un proyecto con ese nombre; ábrelo en la pestaña «Continuar».")
             if not src.is_dir():
                 errors.append(f"La carpeta de origen no existe: `{src}`")
+            elif Path(base).resolve() == src.resolve():
+                errors.append("La carpeta de destino no puede ser la misma que la de origen; "
+                              "elige otra (por ejemplo, tu carpeta personal → Fotos_Organizadas).")
             if not cats:
                 errors.append("Define al menos una categoría.")
             if d_from and d_to and d_from > d_to:
@@ -818,51 +820,28 @@ def video_player(path: Path) -> None:
 # --------------------------------------------------------------------------
 # Limpieza de similares (perceptual hashing)
 # --------------------------------------------------------------------------
-HASH_FUNCS = {"phash": imagehash.phash, "dhash": imagehash.dhash}
-GROUPS_PER_PAGE = 5
+SIM_THUMB = (900, 700)  # miniaturas grandes en la vista de un grupo
 
 
-@st.cache_data(show_spinner=False, max_entries=50000)
-def image_hash(path: str, mtime: float, algo: str) -> str | None:
+@st.cache_data(show_spinner=False, max_entries=60000)
+def image_signature(path: str, mtime: float) -> dict | None:
+    return sim.signature(path)
+
+
+@st.cache_data(show_spinner=False, max_entries=300)
+def sim_thumb(path: str, mtime: float) -> bytes | None:
     try:
         with Image.open(path) as img:
-            img.draft("RGB", (512, 512))  # acelera mucho la decodificación de JPEG grandes
+            img.draft("RGB", (SIM_THUMB[0] * 2, SIM_THUMB[1] * 2))
             img = ImageOps.exif_transpose(img)
-            return str(HASH_FUNCS[algo](img))
+            img.thumbnail(SIM_THUMB)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
     except Exception:
         return None
-
-
-def _popcount(arr: np.ndarray) -> np.ndarray:
-    if hasattr(np, "bitwise_count"):
-        return np.bitwise_count(arr)
-    return np.unpackbits(arr.view(np.uint8)).reshape(-1, 64).sum(axis=1)
-
-
-def group_similar(hashes: list[str], threshold: int) -> list[list[int]]:
-    """Agrupa índices cuyos hashes están a distancia Hamming <= threshold (enlace simple)."""
-    n = len(hashes)
-    if n < 2:
-        return []
-    arr = np.array([int(h, 16) for h in hashes], dtype=np.uint64)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(n - 1):
-        dist = _popcount(arr[i + 1 :] ^ arr[i])
-        for j in np.nonzero(dist <= threshold)[0]:
-            ri, rj = find(i), find(i + 1 + int(j))
-            if ri != rj:
-                parent[rj] = ri
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-    return [g for g in groups.values() if len(g) > 1]
 
 
 def _wkey(key: str) -> str:
@@ -885,6 +864,42 @@ def apply_group(proj: dict, group: list[dict], keep: set[str]) -> list[str]:
     return errors
 
 
+def _sim_candidates(items: list[dict], include_done: bool) -> list[dict]:
+    return [
+        it for it in items
+        if not is_video(it["path"])
+        and (not it.get("decision") or (include_done and it["decision"]["category"] != DISCARD_DIR))
+        and Path(it["path"]).exists()
+    ]
+
+
+def run_similar_search(items: list[dict], sens: str, include_done: bool) -> dict:
+    """Calcula huellas (con caché) y agrupa. Se guarda en sesión: no se recalcula en cada clic."""
+    cands = _sim_candidates(items, include_done)
+    progress = st.progress(0.0, text="Analizando fotos…") if len(cands) > 20 else None
+    keys, ph, dh, times = [], [], [], []
+    for i, it in enumerate(cands):
+        sig = image_signature(it["path"], Path(it["path"]).stat().st_mtime)
+        if sig:
+            keys.append(it["key"])
+            ph.append(sig["phash"])
+            dh.append(sig["dhash"])
+            times.append(datetime.fromisoformat(it["date"]).timestamp() if it.get("date") else None)
+        if progress and i % 25 == 0:
+            progress.progress(i / len(cands), text=f"Analizando fotos… {i}/{len(cands)}")
+    if progress:
+        progress.empty()
+    groups = sim.find_groups(ph, dh, times, sim.SENSITIVITY[sens])
+    order = {k: i for i, k in enumerate(keys)}
+    out = []
+    for g in groups:
+        members = [keys[i] for i in g["members"]]
+        out.append({"keys": members, "level": g["level"], "dist": g["dist"]})
+    # Primero las más seguras (idénticas), y dentro de cada nivel en orden cronológico
+    out.sort(key=lambda g: (g["level"], min(order[k] for k in g["keys"])))
+    return {"params": (sens, include_done), "groups": out, "analyzed": len(keys)}
+
+
 def similar_view(proj: dict, items: list[dict]) -> None:
     h1, h2 = st.columns([3, 1], vertical_alignment="center")
     h1.subheader("1️⃣ Limpieza de similares")
@@ -894,105 +909,159 @@ def similar_view(proj: dict, items: list[dict]) -> None:
         save_project(proj)
         go_to("revision")
     st.caption(
-        "Primer paso: quédate con la mejor foto de cada ráfaga o clon y descarta el resto. "
-        "Las que conserves siguen **pendientes** para clasificarlas en la revisión. "
-        "Tolerancia 0 = idénticas; 4-6 = ráfagas casi iguales; 8-10 = parecidas."
+        "La app busca sola clones y ráfagas con varios niveles de parecido. Tú eliges con qué foto "
+        "quedarte en cada grupo; las demás van a `_Descartadas` (no se borra nada). Las que conservas "
+        "siguen **pendientes** para clasificarlas en la revisión."
     )
-    c1, c2, c3 = st.columns([2, 3, 2], vertical_alignment="bottom")
-    algo = c1.selectbox("Algoritmo", list(HASH_FUNCS), key="sim_algo",
-                        help="phash es más robusto; dhash es más rápido y estricto con ráfagas.")
-    threshold = c2.slider("Tolerancia (distancia Hamming)", 0, 10, 5, key="sim_thr")
-    include_done = c3.checkbox("Incluir ya clasificadas", value=False, key="sim_done",
+
+    c1, c2, c3 = st.columns([3, 2, 1], vertical_alignment="bottom")
+    sens = c1.segmented_control("Sensibilidad", list(sim.SENSITIVITY), default="normal", key="sim_sens",
+                                required=True, format_func=lambda s: sim.SENSITIVITY_LABELS[s],
+                                help="Estricta: solo clones claros · Normal: clones, casi idénticas y ráfagas "
+                                     "(recomendada) · Amplia: encuentra más ráfagas, pero revisa más grupos") \
+        or "normal"
+    include_done = c2.checkbox("Incluir ya clasificadas", value=False, key="sim_done",
                                help="Por defecto solo se comparan las fotos pendientes.")
+    again = c3.button("🔄 Buscar de nuevo", width="stretch")
 
-    cands = [
-        it for it in items
-        if not is_video(it["path"])
-        and (not it.get("decision") or (include_done and it["decision"]["category"] != DISCARD_DIR))
-        and Path(it["path"]).exists()
-    ]
-    if len(cands) < 2:
-        st.info("No hay suficientes fotos para comparar.")
-        return
+    res = ss.get("sim_result")
+    if again or res is None or res["params"] != (sens, include_done):
+        res = ss.sim_result = run_similar_search(items, sens, include_done)
+        ss.sim_idx = 0
+        ss.sim_sel = {}
 
-    progress = st.progress(0.0, text="Calculando hashes…") if len(cands) > 30 else None
-    hashed = []
-    for i, it in enumerate(cands):
-        h = image_hash(it["path"], Path(it["path"]).stat().st_mtime, algo)
-        if h:
-            hashed.append((it, h))
-        if progress and i % 20 == 0:
-            progress.progress(i / len(cands), text=f"Calculando hashes… {i}/{len(cands)}")
-    if progress:
-        progress.empty()
-
+    # Grupos vigentes: se quitan las fotos ya descartadas/clasificadas y los grupos ignorados
+    by_key = {it["key"]: it for it in _sim_candidates(items, include_done)}
     ignored = {frozenset(g) for g in proj.get("similar_ignored", [])}
-    groups = []
-    for g in group_similar([h for _, h in hashed], threshold):
-        members = [hashed[i][0] for i in g]
-        if frozenset(m["key"] for m in members) not in ignored:
-            groups.append(members)
+    live = []
+    for g in res["groups"]:
+        members = [by_key[k] for k in g["keys"] if k in by_key]
+        if len(members) > 1 and frozenset(m["key"] for m in members) not in ignored:
+            live.append({**g, "members": members})
 
-    if not groups:
-        st.success(f"✨ No se encontraron fotos similares entre {len(hashed)} fotos con tolerancia {threshold}.")
+    if not live:
+        st.success(f"✨ No quedan grupos de fotos similares ({res['analyzed']} fotos analizadas). "
+                   "Puedes pasar a la revisión.")
         return
 
-    n_pages = (len(groups) - 1) // GROUPS_PER_PAGE + 1
-    p1, p2 = st.columns([3, 1], vertical_alignment="bottom")
-    p1.markdown(f"**{len(groups)} grupos** · {sum(map(len, groups))} fotos implicadas")
-    page = p2.number_input("Página", 1, n_pages, 1, key="sim_page") if n_pages > 1 else 1
+    counts = Counter(g["level"] for g in live)
+    f1, f2 = st.columns([3, 2], vertical_alignment="bottom")
+    flt = f1.segmented_control(
+        "Mostrar", ["todos", 0, 1, 2], default="todos", key="sim_filter", required=True,
+        format_func=lambda v: f"Todos ({len(live)})" if v == "todos"
+        else f"{sim.LEVELS[v][0]} {sim.LEVELS[v][1]} ({counts.get(v, 0)})",
+    )
+    shown = live if flt in (None, "todos") else [g for g in live if g["level"] == flt]
+    f2.caption(f"{sum(len(g['members']) for g in live)} fotos en {len(live)} grupos · "
+               f"{res['analyzed']} fotos analizadas")
+    if not shown:
+        st.info("No hay grupos de este tipo.")
+        return
 
-    for gi, group in enumerate(groups[(page - 1) * GROUPS_PER_PAGE : page * GROUPS_PER_PAGE]):
-        gid = _wkey("|".join(sorted(m["key"] for m in group)))
-        metas = {}
-        for m in group:
-            stt = Path(m["path"]).stat()
-            metas[m["key"]] = (read_metadata(m["path"], stt.st_mtime), stt.st_size)
-        best = max(group, key=lambda m: ((metas[m["key"]][0]["width"] or 0) * (metas[m["key"]][0]["height"] or 0),
-                                        metas[m["key"]][1]))
+    ss.sim_idx = max(0, min(ss.get("sim_idx", 0), len(shown) - 1))
+    group = shown[ss.sim_idx]
+    members = group["members"]
+    gid = _wkey("|".join(sorted(m["key"] for m in members)))
+
+    # Datos de cada foto y sugerencia de la mejor
+    info = []
+    for m in members:
+        stt = Path(m["path"]).stat()
+        meta = read_metadata(m["path"], stt.st_mtime)
+        sig = image_signature(m["path"], stt.st_mtime) or {"sharp": 0}
+        mp = (meta["width"] or 0) * (meta["height"] or 0) / 1e6
+        info.append({"meta": meta, "size": stt.st_size, "mp": mp, "sharp": sig["sharp"], "mtime": stt.st_mtime})
+    best = sim.best_member(info)
+    max_sharp = max(i["sharp"] for i in info) or 1
+    sel = ss.setdefault("sim_sel", {}).setdefault(gid, {members[best]["key"]})
+
+    # ---- Cabecera y navegación ----
+    icon, label = sim.LEVELS[group["level"]]
+    n1, n2, n3 = st.columns([1, 4, 1], vertical_alignment="center")
+    if n1.button("◀ Anterior", width="stretch", shortcut="Left", disabled=ss.sim_idx == 0):
+        ss.sim_idx -= 1
+        st.rerun()
+    n2.markdown(
+        f"<div style='text-align:center;font-size:1.15rem'><b>Grupo {ss.sim_idx + 1} de {len(shown)}</b>"
+        f" · {icon} {label} · {len(members)} fotos</div>", unsafe_allow_html=True)
+    if n3.button("Siguiente ▶", width="stretch", shortcut="Right", disabled=ss.sim_idx >= len(shown) - 1):
+        ss.sim_idx += 1
+        st.rerun()
+
+    def finish(keep: set[str], msg: str) -> None:
+        errs = apply_group(proj, members, keep)
+        if len(keep) > 1:  # las que conservaste juntas no deben volver a aparecer como grupo
+            proj.setdefault("similar_ignored", []).append(sorted(keep))
+            save_project(proj)
+        ss.sim_sel.pop(gid, None)
+        ss.flash = ("error", "; ".join(errs)) if errs else ("toast", msg)
+        st.rerun()  # el grupo desaparece de la lista y aparece el siguiente en su lugar
+
+    # ---- Ampliación ----
+    zoom = ss.get("sim_zoom")
+    if zoom in {m["key"] for m in members}:
+        zm = next(m for m in members if m["key"] == zoom)
         with st.container(border=True):
-            st.markdown(f"**Grupo {(page - 1) * GROUPS_PER_PAGE + gi + 1}** · {len(group)} fotos")
-            keep = set()
-            per_row = min(len(group), 4)
-            for row in range(0, len(group), per_row):
-                cols = st.columns(per_row)
-                for col, m in zip(cols, group[row : row + per_row]):
-                    meta, size = metas[m["key"]]
-                    with col:
-                        thumb = thumb_bytes(m["path"], Path(m["path"]).stat().st_mtime)
-                        if thumb:
-                            st.image(thumb, width="stretch")
-                        dt = (datetime.fromisoformat(meta["date"]).strftime("%d/%m/%Y %H:%M:%S")
-                              if meta["date"] else "sin fecha")
-                        dec = m.get("decision")
-                        estado = f" · 📁 {dec['category']}" if dec else ""
-                        res = f"{meta['width']}×{meta['height']}" if meta["width"] else "?"
-                        st.caption(
-                            f"`{Path(m['key']).name}`{estado}  \n"
-                            f"🖼️ {res} · 💾 {size / (1024 * 1024):.2f} MB  \n📅 {dt}"
-                            + ("  \n⭐ **Mejor calidad**" if m is best else "")
-                        )
-                        if st.checkbox("Conservar", value=m is best, key=f"keep_{gid}_{_wkey(m['key'])}"):
-                            keep.add(m["key"])
-                        if st.button("⭐ Solo esta", key=f"only_{gid}_{_wkey(m['key'])}", width="stretch",
-                                     help="Conservar esta y descartar las demás del grupo"):
-                            errs = apply_group(proj, group, {m["key"]})
-                            ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto: las conservadas siguen pendientes hasta clasificarlas en Revisión")
-                            st.rerun()
-            b1, b2 = st.columns([3, 1])
-            n_disc = len(group) - len(keep)
-            if b1.button(
-                f"✅ Conservar {len(keep)} y descartar {n_disc}",
-                key=f"apply_{gid}", type="primary", width="stretch", disabled=not keep or not n_disc,
-            ):
-                errs = apply_group(proj, group, keep)
-                ss.flash = ("error", "; ".join(errs)) if errs else ("toast", "Grupo resuelto: las conservadas siguen pendientes hasta clasificarlas en Revisión")
+            z1, z2 = st.columns([5, 1], vertical_alignment="center")
+            z1.markdown(f"🔍 **{Path(zm['key']).name}**")
+            if z2.button("✖ Cerrar", key="sim_zoom_close", width="stretch", shortcut="Esc"):
+                ss.sim_zoom = None
                 st.rerun()
-            if b2.button("🙈 No son duplicadas", key=f"ign_{gid}", width="stretch",
-                         help="Ocultar este grupo en el futuro"):
-                proj.setdefault("similar_ignored", []).append(sorted(m["key"] for m in group))
-                save_project(proj)
-                st.rerun()
+            data = display_bytes(zm["path"], Path(zm["path"]).stat().st_mtime)
+            if data:
+                st.image(data, width="stretch")
+
+    # ---- Fotos del grupo ----
+    per_row = 2 if len(members) <= 2 else (3 if len(members) in (3, 6, 9) else 4)
+    for row in range(0, len(members), per_row):
+        cols = st.columns(per_row)
+        for col, idx in zip(cols, range(row, min(row + per_row, len(members)))):
+            m, inf = members[idx], info[idx]
+            keep = m["key"] in sel
+            with col.container(border=True):
+                st.markdown(
+                    f"<div style='text-align:center;font-weight:600;padding:2px;border-radius:6px;"
+                    f"background:{'#16a34a33' if keep else '#dc262622'}'>"
+                    f"{'✅ SE CONSERVA' if keep else '🗑️ Se descarta'}"
+                    f"{' · ⭐ sugerida' if idx == best else ''}</div>", unsafe_allow_html=True)
+                thumb = sim_thumb(m["path"], inf["mtime"])
+                if thumb:
+                    st.image(thumb, width="stretch")
+                meta = inf["meta"]
+                dt = datetime.fromisoformat(meta["date"]).strftime("%d/%m/%Y %H:%M:%S") if meta["date"] else "sin fecha"
+                res_txt = f"{meta['width']}×{meta['height']}" if meta["width"] else "?"
+                st.caption(
+                    f"**[{idx + 1}]** `{Path(m['key']).name}`  \n"
+                    f"🖼️ {res_txt} · 💾 {inf['size'] / (1024 * 1024):.2f} MB  \n📅 {dt}  \n"
+                    f"🔎 Nitidez: {inf['sharp'] / max_sharp * 100:.0f} %"
+                )
+                b1, b2, b3 = st.columns([3, 2, 1])
+                if b1.button(f"⭐ Me quedo con esta", key=f"only_{gid}_{idx}", type="primary",
+                             width="stretch", shortcut=str(idx + 1) if idx < 9 else None,
+                             help="Conserva solo esta foto y descarta las demás del grupo"):
+                    finish({m["key"]}, f"Te quedaste con {Path(m['key']).name}")
+                if b2.button("➖ Quitar" if keep else "➕ También", key=f"tog_{gid}_{idx}", width="stretch",
+                             help="Marca o desmarca esta foto para conservarla junto a otras"):
+                    sel.symmetric_difference_update({m["key"]})
+                    st.rerun()
+                if b3.button("🔍", key=f"zoom_{gid}_{idx}", width="stretch", help="Ver en grande"):
+                    ss.sim_zoom = m["key"]
+                    st.rerun()
+
+    # ---- Acciones del grupo ----
+    n_disc = len(members) - len(sel)
+    a1, a2 = st.columns([3, 2])
+    if a1.button(f"✅ Aplicar: conservar {len(sel)} y descartar {n_disc}", type="primary", width="stretch",
+                 shortcut="Enter", disabled=not sel or not n_disc, key=f"apply_{gid}"):
+        finish(set(sel), f"Grupo resuelto: {len(sel)} conservada(s), {n_disc} descartada(s)")
+    if a2.button("🙈 No son duplicadas (conservar todas)", width="stretch", shortcut="N", key=f"ign_{gid}"):
+        proj.setdefault("similar_ignored", []).append(sorted(m["key"] for m in members))
+        save_project(proj)
+        ss.sim_sel.pop(gid, None)
+        ss.flash = ("toast", "Grupo marcado como no duplicado")
+        st.rerun()
+    st.caption("⌨️ **1-9** me quedo con esa foto · **Enter** aplicar selección · **N** no son duplicadas · "
+               "**← / →** grupo anterior / siguiente · Las conservadas siguen pendientes para la revisión.")
 
 
 # --------------------------------------------------------------------------

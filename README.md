@@ -94,7 +94,15 @@ muestra siempre la ruta completa y el botón **📂 Abrir carpeta del proyecto**
 ## Uso
 
 Crea un **nuevo proyecto** (nombre, carpeta de origen, categorías iniciales, copiar
-o mover y, opcionalmente, un rango de fechas) o **continúa** uno existente. El trabajo
+o mover y, opcionalmente, un rango de fechas) o **continúa** uno existente (si ya
+tienes proyectos, esa pestaña aparece primero, con una tarjeta por proyecto).
+
+**Las carpetas se eligen sin escribir rutas:** el botón **📂 Elegir carpeta…** abre la
+ventana de tu escritorio (zenity en GNOME/Fedora, kdialog en KDE; `instalar.sh` instala
+zenity). Si la ventana no aparece, puede haber quedado detrás del navegador. Como
+alternativa, **🗂️ Explorar aquí** abre un explorador dentro de la app, con accesos
+rápidos a tu carpeta personal, Escritorio, Imágenes y discos externos, y un botón para
+crear una carpeta nueva. El trabajo
 sigue tres pasos, que eliges en la barra lateral («Flujo de trabajo»):
 
 1. **1️⃣ Similares**: primero eliminas clones y ráfagas. Las fotos que conservas
@@ -136,16 +144,28 @@ Los vídeos de más de 500 MB piden confirmación antes de cargarse en el navega
 
 ### 1️⃣ Limpieza de similares
 
-- Calcula un *hash perceptual* (`phash` o `dhash`) de cada foto pendiente
-  (opcionalmente también de las ya clasificadas).
-- Con **Tolerancia** (distancia Hamming 0–10) eliges entre clones exactos (0),
-  ráfagas (4–6) o fotos simplemente parecidas (8–10).
-- Muestra cada grupo lado a lado con resolución, tamaño y fecha, y marca la de
-  mejor calidad (mayor resolución y tamaño).
-- **Conservar N y descartar el resto** aplica las casillas marcadas; **⭐ Solo esta**
-  resuelve el grupo con un clic. Las descartadas van a `_Descartadas/` y las conservadas
-  quedan pendientes para clasificarlas en la revisión.
-- **No son duplicadas** oculta ese grupo para siempre (se guarda en el JSON del proyecto).
+La búsqueda es automática: en una sola pasada prueba varios niveles de parecido y
+etiqueta cada grupo como **🟢 Idénticas** (clones o recompresiones), **🟡 Casi idénticas**
+o **🟠 Ráfaga** (parecidas y tomadas con pocos segundos de diferencia). Para evitar falsos
+positivos exige que coincidan dos huellas distintas (phash y dhash) y, en las ráfagas,
+la cercanía en el tiempo. La **sensibilidad** (Estricta / Normal / Amplia) ajusta todos
+los umbrales a la vez.
+
+Ves **un grupo cada vez**, con las fotos en grande, su resolución, tamaño, fecha y
+nitidez. La app marca como **⭐ sugerida** la de más resolución; en ráfagas, la más
+nítida (descarta las movidas). Tú decides:
+
+| Tecla / botón | Acción |
+|---|---|
+| `1`–`9` · **⭐ Me quedo con esta** | Conserva esa foto y descarta las demás del grupo |
+| **➕ También / ➖ Quitar** y luego `Enter` | Conservar varias del grupo |
+| `N` · **No son duplicadas** | Conserva todas; el grupo no vuelve a aparecer |
+| `←` / `→` | Grupo anterior / siguiente (saltar sin decidir) |
+| **🔍** y `Esc` | Ver una foto en grande y cerrar |
+
+Las descartadas van a `_Descartadas/` y las conservadas quedan **pendientes** para
+clasificarlas en la revisión. Los grupos resueltos se recuerdan en el registro del
+proyecto: no vuelven a salir aunque cierres la app.
 
 ### 3️⃣ Optimización y compresión (opcional)
 

@@ -1,0 +1,8 @@
+[client]
+toolbarMode = "minimal"      # oculta el botón «Deploy» (app local)
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#2563eb"

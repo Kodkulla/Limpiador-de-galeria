@@ -29,7 +29,7 @@ fi
 
 if command -v dnf >/dev/null 2>&1; then
     echo "📦 Fedora detectado: instalando paquetes con dnf…"
-    PKGS=(python3 perl-Image-ExifTool jpegoptim optipng libjpeg-turbo-utils)
+    PKGS=(python3 perl-Image-ExifTool jpegoptim optipng libjpeg-turbo-utils zenity)
     # Si ya hay un ffmpeg (p. ej. el completo de RPM Fusion) no se instala ffmpeg-free encima
     command -v ffmpeg >/dev/null 2>&1 || PKGS+=(ffmpeg-free)
     $SUDO dnf install -y "${PKGS[@]}"
@@ -53,7 +53,7 @@ elif command -v apt-get >/dev/null 2>&1; then
     echo "📦 Debian/Ubuntu detectado: instalando paquetes con apt…"
     $SUDO apt-get update
     $SUDO apt-get install -y python3 python3-venv libimage-exiftool-perl \
-        ffmpeg jpegoptim optipng libjpeg-turbo-progs
+        ffmpeg jpegoptim optipng libjpeg-turbo-progs zenity
     $SUDO apt-get install -y oxipng >/dev/null 2>&1 \
         || echo "ℹ️  oxipng no está disponible; se usará optipng para los PNG."
     if [ "$RPMFUSION" -eq 1 ]; then
