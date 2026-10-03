@@ -478,6 +478,45 @@ def unclassify(proj: dict, item: dict) -> None:
     save_project(proj)
 
 
+def _decision_items(proj: dict, category: str) -> list[dict]:
+    return [{"key": k, "path": d["dest"], "date": d.get("date"), "decision": d}
+            for k, d in list(proj["decisions"].items()) if d["category"] == category]
+
+
+def _remove_category(proj: dict, category: str) -> None:
+    proj["categories"] = [c for c in proj["categories"] if c != category]
+    try:
+        (project_dir(proj) / category).rmdir()  # solo si quedó vacía; nunca borra archivos
+    except OSError:
+        pass
+    save_project(proj)
+
+
+def delete_category(proj: dict, category: str, target: str | None) -> list[str]:
+    """Elimina una categoría. Sus fotos pasan a `target` (otra categoría) o, si es None,
+    vuelven a pendientes. No se borra ninguna foto."""
+    errors = []
+    for item in _decision_items(proj, category):
+        try:
+            if target is None:
+                unclassify(proj, item)
+            else:
+                classify(proj, item, target)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{Path(item['path']).name}: {e}")
+    if not errors:  # si algo falló, la categoría se mantiene para no esconder esas fotos
+        _remove_category(proj, category)
+    return errors
+
+
+def rename_category(proj: dict, old: str, new: str) -> list[str]:
+    """Renombra moviendo las fotos a la carpeta nueva (y con el nuevo prefijo en el nombre)."""
+    cats = proj["categories"]
+    cats.insert(cats.index(old), new)  # misma posición: conserva su tecla 1-9
+    ensure_category_dirs(proj)
+    return delete_category(proj, old, new)
+
+
 # --------------------------------------------------------------------------
 # Estado de sesión
 # --------------------------------------------------------------------------
@@ -701,6 +740,56 @@ def sidebar_project(proj: dict) -> None:
                 ss.flash = ("success", f"Categoría «{c}» añadida.")
             st.rerun()
 
+    with sb.expander("✏️ Editar o eliminar categorías"):
+        counts = Counter(d["category"] for d in proj["decisions"].values())
+        cats = proj["categories"]
+        cat = st.selectbox("Categoría", cats, key="cat_edit_sel",
+                           format_func=lambda c: f"{c} ({counts.get(c, 0)} fotos)")
+        action = st.radio("Acción", ["renombrar", "eliminar"], horizontal=True, key="cat_edit_action",
+                          format_func=lambda a: "✏️ Renombrar" if a == "renombrar" else "🗑️ Eliminar")
+        n = counts.get(cat, 0)
+        if action == "renombrar":
+            new = safe_name(st.text_input("Nuevo nombre", key="cat_edit_new"))
+            if n and new:
+                st.caption(f"Sus {n} fotos pasarán a la carpeta «{new}» y se renombrarán "
+                           f"({_abbr(proj['name'])}_{_abbr(new)}_…).")
+            if st.button("✏️ Renombrar", width="stretch", disabled=not new or new == cat):
+                if new == DISCARD_DIR or new in cats:
+                    ss.flash = ("error", f"Ya existe una categoría «{new}» o el nombre no es válido.")
+                else:
+                    with st.spinner(f"Moviendo {n} fotos…"):
+                        errs = rename_category(proj, cat, new)
+                    if ss.get("last_cat") == cat:
+                        ss.last_cat = new
+                    ss.flash = (("warning", "Renombrada con errores: " + "; ".join(errs[:5])) if errs
+                                else ("success", f"Categoría «{cat}» renombrada a «{new}»."))
+                st.rerun()
+        else:
+            target = None
+            if n:
+                options = ["__pendiente__"] + [c for c in cats if c != cat] + [DISCARD_DIR]
+                choice = st.selectbox(
+                    f"¿Qué hacer con sus {n} fotos?", options, key="cat_edit_target",
+                    format_func=lambda c: "⏳ Volver a pendientes (revisarlas de nuevo)" if c == "__pendiente__"
+                    else ("🗑️ Mover a _Descartadas" if c == DISCARD_DIR else f"📁 Mover a «{c}»"),
+                )
+                target = None if choice == "__pendiente__" else choice
+                st.caption("No se borra ninguna foto: solo cambian de carpeta"
+                           + (" (en modo copiar, «volver a pendientes» quita la copia; "
+                              "el original sigue en el origen)." if proj["mode"] == "copiar" else "."))
+            confirm = st.checkbox(f"Sí, eliminar «{cat}»", key=f"cat_edit_confirm_{cat}")
+            if st.button("🗑️ Eliminar categoría", width="stretch", type="primary",
+                         disabled=not confirm or len(cats) == 1,
+                         help="Debe quedar al menos una categoría" if len(cats) == 1 else None):
+                with st.spinner(f"Moviendo {n} fotos…"):
+                    errs = delete_category(proj, cat, target)
+                if ss.get("last_cat") == cat:
+                    ss.pop("last_cat")
+                ss.scan = None  # en modo mover, las que vuelven al origen deben re-escanearse
+                ss.flash = (("warning", "No se pudo eliminar del todo: " + "; ".join(errs[:5])) if errs
+                            else ("success", f"Categoría «{cat}» eliminada."))
+                st.rerun()
+
     with sb.expander("⚙️ Ajustes del proyecto"):
         mode = st.radio(
             "Acción al clasificar", ["copiar", "mover"],
@@ -776,6 +865,63 @@ def sidebar_metadata(item: dict) -> None:
         )
     else:
         sb.info("📍 Sin datos de geolocalización")
+
+
+STRIP_SIZE = (240, 180)  # miniaturas de la tira «anteriores / siguientes»
+
+
+@st.cache_data(show_spinner=False, max_entries=3000)
+def strip_thumb(path: str, mtime: float) -> bytes | None:
+    """Miniatura de tamaño fijo (con bandas) para que la tira quede alineada."""
+    try:
+        if is_video(path):
+            data = comp.extract_frame(Path(path), 1.0) or comp.extract_frame(Path(path), 0.0)
+            if not data:
+                return None
+            img = Image.open(BytesIO(data))
+        else:
+            img = Image.open(path)
+            img.draft("RGB", (STRIP_SIZE[0] * 2, STRIP_SIZE[1] * 2))
+            img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        img.thumbnail(STRIP_SIZE)
+        canvas = Image.new("RGB", STRIP_SIZE, (30, 32, 38))
+        canvas.paste(img, ((STRIP_SIZE[0] - img.width) // 2, (STRIP_SIZE[1] - img.height) // 2))
+        buf = BytesIO()
+        canvas.save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def filmstrip(items: list[dict], idx: int, before: int = 2, after: int = 4) -> None:
+    """Las `before` anteriores, la actual y las `after` siguientes; clic para saltar."""
+    cols = st.columns(before + 1 + after)
+    for col, off in zip(cols, range(-before, after + 1)):
+        j = idx + off
+        if not 0 <= j < len(items):
+            continue
+        it = items[j]
+        p = Path(it["path"])
+        dec = it.get("decision")
+        badge = "⏳" if not dec else ("🗑️" if dec["category"] == DISCARD_DIR else f"✅ {dec['category']}")
+        with col:
+            st.markdown(
+                f"<div style='height:4px;border-radius:2px;margin-bottom:3px;"
+                f"background:{'#2563eb' if off == 0 else 'transparent'}'></div>", unsafe_allow_html=True)
+            thumb = strip_thumb(str(p), p.stat().st_mtime) if p.exists() else None
+            if thumb:
+                st.image(thumb, width="stretch")
+            else:
+                st.caption("(sin vista previa)")
+            icon = "🎬 " if is_video(p) else ""
+            if off == 0:
+                st.markdown(f"<div style='text-align:center;font-size:.85rem'><b>▶ {icon}{j + 1} · actual</b>"
+                            f"<br>{badge}</div>", unsafe_allow_html=True)
+            elif st.button(f"{icon}{j + 1} · {badge}", key=f"strip_{j}", width="stretch",
+                           help=Path(it["key"]).name):
+                ss.idx = j
+                st.rerun()
 
 
 VIDEO_MIME = {".webm": "video/webm", ".mkv": "video/webm", ".avi": "video/x-msvideo"}
@@ -1586,9 +1732,9 @@ def review_view(proj: dict, items: list[dict]) -> None:
         video_player(path)
     elif (data := display_bytes(str(path), path.stat().st_mtime) if path.exists() else None):
         _, mid, _ = st.columns([1, 10, 1])
-        with mid:
+        with mid.container(key="viewer"):
             st.markdown(
-                "<style>[data-testid='stImage'] img{display:block;margin:auto;max-height:72vh;"
+                "<style>.st-key-viewer [data-testid='stImage'] img{display:block;margin:auto;max-height:68vh;"
                 "width:auto!important;max-width:100%;object-fit:contain;border-radius:6px}</style>",
                 unsafe_allow_html=True,
             )
@@ -1597,6 +1743,9 @@ def review_view(proj: dict, items: list[dict]) -> None:
         st.error("No se pudo abrir esta imagen (formato no soportado o archivo dañado).")
     else:
         st.error(f"El archivo ya no existe: `{path}`")
+
+    # ---- Anteriores / siguientes ----
+    filmstrip(items, ss.idx)
 
     # ---- Acciones ----
     def act(fn, *args, msg: str):

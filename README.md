@@ -113,6 +113,20 @@ sigue tres pasos, que eliges en la barra lateral («Flujo de trabajo»):
    con los botones o el teclado; el progreso se guarda tras cada archivo.
 3. **3️⃣ Optimizar** (opcional): compresión sin pérdida de calidad de lo ya organizado.
 
+Durante la revisión, bajo la foto hay una **tira con las 2 anteriores y las 4 siguientes**
+(con su estado: ⏳ pendiente, ✅ categoría o 🗑️ descartada). Pulsa cualquiera para saltar a ella.
+
+### Editar o eliminar categorías
+
+En la barra lateral, **✏️ Editar o eliminar categorías**:
+
+- **Renombrar**: sus fotos pasan a la carpeta nueva y se renombran con el nuevo prefijo
+  (`VAC_PLA_…` → `VAC_MAR_…`). Conserva su tecla `1`–`9`.
+- **Eliminar** (pide confirmación): si tiene fotos, eliges si **vuelven a pendientes**
+  para revisarlas de nuevo o pasan a **otra categoría** o a `_Descartadas`. No se borra
+  ninguna foto. En modo copiar, «volver a pendientes» quita la copia del proyecto; el
+  original sigue en el origen. La carpeta se elimina solo si queda vacía.
+
 ### Renombrado automático
 
 Al clasificar, cada archivo se renombra como `[PRO]_[CAT]_[FECHA].ext`:
